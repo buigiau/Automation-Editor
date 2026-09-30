@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+output/
+config.yaml
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+models/*.task
+models/*.download
+models/whisper/
+models/characters/

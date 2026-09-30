@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "created_at": "2026-09-21T00:00:00Z",
+  "project": {
+    "premiere_project": "",
+    "source_sequence": "",
+    "template_sequence": "PJ 5 - demo",
+    "source_video": "",
+    "source_media": "",
+    "cubase_project": "",
+    "import_source_video": true,
+    "save_project": false
+  },
+  "categories": ["A", "E", "O", "HAHA", "CRY", "CLOSED", "NEUTRAL"],
+  "slots": [
+    {
+      "index": 0,
+      "id": "slot-01",
+      "premiere": {
+        "nested_sequence": "1",
+        "timeline_start_sec": 1.0,
+        "duration_sec": 0.96,
+        "occurrences": 12,
+        "video_track_index": 1
+      },
+      "cubase": {
+        "track_name": "Sampler Track 01",
+        "track_index": 1,
+        "start_sec": 1.0
+      },
+      "order": 0,
+      "source_video": "",
+      "source_start_sec": 12.4,
+      "source_end_sec": 13.2,
+      "category": "A",
+      "target_sequence": "PJ 5 - demo",
+      "target_slot": "slot-01",
+      "cubase_track": "Sampler Track 01",
+      "audio": {
+        "path": "",
+        "category": "A",
+        "duration_sec": 0.4
+      },
+      "video": {
+        "in_sec": 12.4,
+        "out_sec": 13.2,
+        "category": "A",
+        "score": 0.82
+      }
+    }
+  ],
+  "mixdown": {
+    "path": "./output/mixdown.wav",
+    "duration_sec": 65.8,
+    "sample_rate": 48000,
+    "channels": 2
+  }
+}

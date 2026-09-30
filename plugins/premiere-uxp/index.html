@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>AutoEdit</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      font: 12px/1.4 "Adobe Clean", Segoe UI, sans-serif;
+      margin: 0; padding: 12px;
+      background: #2d2d2d; color: #eee;
+    }
+    h1 { font-size: 14px; margin: 0 0 8px; }
+    button, input {
+      font: inherit; width: 100%; box-sizing: border-box;
+      margin: 0 0 6px; padding: 6px 8px;
+      background: #4a4a4a; color: #fff; border: 1px solid #666; border-radius: 3px;
+    }
+    button:hover { background: #5a5a5a; }
+    #log {
+      white-space: pre-wrap; background: #1c1c1c; padding: 8px;
+      height: 220px; overflow: auto; border-radius: 3px; font-size: 11px;
+    }
+    .row { color: #aaa; margin-bottom: 8px; }
+  </style>
+</head>
+<body>
+  <h1>AutoEdit</h1>
+  <div class="row">Uses the currently open Premiere project. Finds <code>PJ 5 - demo</code>, imports the plan's source video if needed, and fills slots. Does not save.</div>
+  <button id="inspect">Inspect open project</button>
+  <button id="load">Load edit-plan.json…</button>
+  <button id="apply">Fill nested clips (one source cut per clip)</button>
+  <label><input id="autoMix" type="checkbox" style="width: auto; margin-right: 6px;" />Import audio after filling clips</label>
+  <button id="mix">Import mixdown WAV</button>
+  <div id="log"></div>
+  <script src="main.js"></script>
+</body>
+</html>

@@ -1,0 +1,58 @@
+# Copy to config.yaml if you want to change analysis settings.
+# Premiere / Cubase / video / audio paths are chosen in the GUI or via CLI flags.
+
+job:
+  name: job
+  output_dir: ./output
+
+premiere:
+  project: ""
+  source_sequence: ""          # unused; source is the selected video file
+  template_sequence: "PJ 5 - demo"
+  source_media: ""
+  slot_mode: nested_sequences
+  video_track_index: 1
+  import_mixdown: true
+
+audio:
+  directory: 'D:\Editor\Voice'
+  glob: "*.wav"
+  files: []
+  max_files: 0
+
+video:
+  source_kind: live_action
+  source_gap_sec: 5.0
+  sample_fps: 6
+  max_seconds: 0
+  min_segment_sec: 0.20
+  merge_gap_sec: 0.80
+  backend: auto
+  speech_model: small
+  speech_language: en  # null enables language detection
+  characters:
+    enabled: true
+    coverage_target: 0.75
+    min_main_fraction: 0.85
+    arcface_model: ""  # default: models/characters/arcface.onnx
+    ccip_model: ""     # default: models/characters/ccip.onnx
+    arcface_cosine_distance: 0.35
+    ccip_cosine_distance: 0.20  # cosine; not the CCIP learned-metric threshold
+
+cubase:
+  project: ""
+  track_name_pattern: "Sampler Track {index:02d}"
+  sampler_track_count: 16
+  sample_rate: 48000
+  channels: 2
+
+categories:
+  - A
+  - E
+  - O
+  - U
+  - LAUGH
+  - HAHA
+  - CRY
+  - CLOSED
+  - NEUTRAL
