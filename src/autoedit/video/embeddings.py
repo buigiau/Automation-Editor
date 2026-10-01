@@ -5,6 +5,7 @@ import hashlib
 from pathlib import Path
 
 import numpy as np
+from autoedit.acceleration import device_settings, is_accelerator_error, prepare_nvidia_runtime
 
 MODEL_ROOT = Path(__file__).resolve().parents[3] / "models" / "characters"
 CCIP_MODEL = "ccip-caformer-24-randaug-pruned"
@@ -36,10 +37,11 @@ class EmbeddingModel:
         import onnxruntime as ort
         self.kind = kind
         self.path = model_path(kind, config)
-        options = ort.SessionOptions()
-        options.intra_op_num_threads = 2
-        options.inter_op_num_threads = 1
-        self.session = ort.InferenceSession(str(self.path), options, providers=["CPUExecutionProvider"])
+        self.requested_device, self.device_index = device_settings(
+            config.get("device", "auto"), config.get("device_index", 0))
+        self.ort = ort
+        self.fallback_reason = None
+        self.session = self._create_session()
         self.input = self.session.get_inputs()[0]
         expected = 384 if kind == "animation" else 112
         shape = self.input.shape
@@ -48,6 +50,58 @@ class EmbeddingModel:
         self.size = shape[2] if isinstance(shape[2], int) else expected
         if isinstance(shape[3], int) and shape[3] != self.size:
             raise ValueError("Character model input must be square.")
+
+    def _session(self, providers):
+        options = self.ort.SessionOptions()
+        options.intra_op_num_threads = 2
+        options.inter_op_num_threads = 1
+        return self.ort.InferenceSession(str(self.path), options, providers=providers)
+
+    def _create_session(self):
+        if self.requested_device != "cpu":
+            prepare_nvidia_runtime()
+            if "CUDAExecutionProvider" in self.ort.get_available_providers():
+                try:
+                    if hasattr(self.ort, "preload_dlls"):
+                        self.ort.preload_dlls()
+                    session = self._session([
+                        ("CUDAExecutionProvider", {"device_id": self.device_index, "use_tf32": 0,
+                                                   "cudnn_conv_use_max_workspace": 0}),
+                        "CPUExecutionProvider"])
+                    if "CUDAExecutionProvider" not in session.get_providers():
+                        raise RuntimeError("CUDAExecutionProvider could not initialize")
+                    # Own the fallback so execution metadata cannot falsely report CUDA.
+                    session.disable_fallback()
+                    self.device = "cuda"
+                    return session
+                except Exception as exc:
+                    if self.requested_device == "cuda" or not is_accelerator_error(exc):
+                        raise
+                    self.fallback_reason = str(exc)
+            elif self.requested_device == "cuda":
+                raise RuntimeError("CUDAExecutionProvider unavailable; install the GPU requirements")
+            else:
+                self.fallback_reason = "CUDAExecutionProvider unavailable"
+        self.device = "cpu"
+        return self._session(["CPUExecutionProvider"])
+
+    @property
+    def execution(self):
+        return {"device": self.device, "providers": self.session.get_providers(),
+                "device_index": self.device_index if self.device == "cuda" else None,
+                "fallback_reason": self.fallback_reason}
+
+    def _run(self, tensor):
+        try:
+            return self.session.run(None, {self.input.name: tensor})
+        except Exception as exc:
+            if self.device != "cuda" or self.requested_device != "auto" or not is_accelerator_error(exc):
+                raise
+            self.session = None
+            self.fallback_reason = str(exc)
+            self.device = "cpu"
+            self.session = self._session(["CPUExecutionProvider"])
+            return self.session.run(None, {self.input.name: tensor})
 
     def extract(self, frame, face, frame_width, frame_height, other_faces=()):
         import cv2
@@ -92,7 +146,7 @@ class EmbeddingModel:
         else:
             rgb = (rgb - 127.5) / 127.5
         tensor = np.ascontiguousarray(rgb.transpose(2, 0, 1)[None])
-        vector = np.asarray(self.session.run(None, {self.input.name: tensor})[0], np.float32).reshape(-1)
+        vector = np.asarray(self._run(tensor)[0], np.float32).reshape(-1)
         norm = float(np.linalg.norm(vector))
         if not np.isfinite(vector).all() or norm <= 1e-8:
             raise ValueError("Character embedding model returned an invalid vector.")

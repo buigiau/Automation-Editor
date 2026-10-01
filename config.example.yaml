@@ -29,9 +29,14 @@ video:
   merge_gap_sec: 0.80
   backend: auto
   speech_model: small
+  speech_device: auto  # auto prefers CUDA; cpu forces CPU; cuda requires GPU
+  speech_compute_type: auto  # CUDA: int8_float16; CPU: int8
+  speech_device_index: 0
   speech_language: en  # null enables language detection
   characters:
     enabled: true
+    device: auto
+    device_index: 0
     coverage_target: 0.75
     min_main_fraction: 0.85
     arcface_model: ""  # default: models/characters/arcface.onnx
