@@ -33,7 +33,7 @@ def write_audio_review(plan, output_dir, speech):
         uid = prem["nested_sequence_uid"]
         words = " ".join(w["word"] for w in speech.get("words", [])
                          if w["start"] < video["out_sec"] and w["end"] > video["in_sec"])
-        matched = match.get("source_word")
+        matched = match.get("source_word") or match.get("source_action")
         method = f'Từ nguồn: {matched}' if matched else 'Ước lượng theo hình miệng / âm dự phòng'
         status = "Cần kiểm tra" if match.get("needs_review") else "Đã đối chiếu từ; nghe xác nhận"
         src_player = (f'<audio controls preload="none" src="{escape(originals[uid], quote=True)}"></audio>'

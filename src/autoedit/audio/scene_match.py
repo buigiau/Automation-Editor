@@ -4,7 +4,8 @@ import math
 
 from autoedit.match.matcher import same_family
 from autoedit.audio.selection import select_audio_for_source
-from autoedit.audio.taxonomy import TAXONOMY, item_group, spoken_words, transcript_token
+from autoedit.audio.taxonomy import TAXONOMY, item_group
+from autoedit.audio.pronunciation import VoiceIndex, source_sounds, valid_sound
 
 WORD_SHAPES = {sound.label: sound.visemes[0] for _, sound in TAXONOMY.values()
                if sound.visemes and sound.action == "SPEECH" and sound.label not in {"A", "E", "O", "U"}}
@@ -23,41 +24,61 @@ def _active_bounds(item):
 
 def _source_word_audio(candidates, video, video_info, used):
     start, end = video["in_sec"], video["out_sec"]
-    words = [w for w in video_info.get("source_speech", {}).get("words", [])
-             if w.get("prob", 0) >= 0.6 and start <= w["start"] < w["end"] <= end]
+    anchor = video.get("source_sound")
+    if anchor:
+        if not valid_sound(anchor) or abs(anchor["start"]-start) > .001 or anchor["end"] > end:
+            raise ValueError("Selected source sound no longer agrees with the cut onset; regenerate the plan.")
+        sound = anchor
+        supported = anchor["matches"]
+    else:
+        # The first sound blocks all later words, even if it is unsupported or
+        # uncertain. A cut through a word must not match the following word.
+        sounds = [s for s in source_sounds(video_info.get("source_speech", {}))
+                  if s["start"] < end and s["end"] > start]
+        if not sounds:
+            return None
+        sound = sounds[0]
+        threshold = .75 if sound.get("action") else .6
+        if not start <= sound["start"] <= start+.25 or sound["end"] > end or sound["prob"] < threshold:
+            return None
+        supported = VoiceIndex(candidates).match(sound)
+    matches = {m["path"]: m for m in supported}
     ranked, seen = [], set()
     for item in candidates:
         if item["path"] in seen:
             continue
         seen.add(item["path"])
-        tokens = spoken_words(item)
         lo, hi = _active_bounds(item)
         length = hi-lo
-        if not tokens or not math.isfinite(length) or length <= 0:
+        if item["path"] not in matches or not math.isfinite(length) or length <= 0:
             continue
-        for word in words:
-            if transcript_token(word["word"]) not in tokens:
-                continue
-            word_length = word["end"]-word["start"]
-            fit = min(length, word_length)/max(length, word_length)
-            retained = min(length, end-word["start"])/length
-            score = 3*word["prob"] + fit + retained - .08*used[item["path"]]
-            ranked.append((score, fit, retained, item, word, lo, hi))
+        word_length = sound["end"]-sound["start"]
+        fit = min(length, word_length)/max(length, word_length)
+        retained = min(length, end-sound["start"])/length
+        score = 3*sound["prob"] + fit + retained - .08*used[item["path"]]
+        ranked.append((score, fit, retained, item, sound, lo, hi))
     if not ranked:
+        if anchor:
+            raise ValueError("WAV matched to the cut onset is missing from the Voice library; regenerate the plan.")
         return None
     score, fit, retained, item, word, lo, hi = max(ranked, key=lambda row: row[0])
     chosen = dict(item, segment_start_sec=lo, segment_end_sec=min(hi, lo+end-word["start"]),
                   placement_offset_sec=word["start"]-start)
-    evidence = {"method": "source-audio-whisper-exact-word", "score": round(score, 4),
-                "source_word": word["word"], "source_word_start_sec": word["start"],
+    match = matches[item["path"]]
+    evidence = {"method": match["kind"], "score": round(score, 4),
+                "source_word": word.get("word"), "source_action": word.get("action"),
+                "source_pronunciation": match.get("phones", []),
+                "cut_onset_matched": True,
+                "source_word_start_sec": word["start"],
                 "source_word_end_sec": word["end"], "word_probability": word["prob"],
                 "duration_fit": round(fit, 4), "retained_fraction": round(retained, 4),
                 "transcript_model": video_info.get("source_speech", {}).get("model"),
                 "phoneme_sync_verified": False,
-                "needs_review": word["prob"] < .8 or fit < .5 or retained < .9
+                "needs_review": match["kind"] != "source-audio-whisper-exact-word"
+                                or word["prob"] < .8 or fit < .5 or retained < .9
                                 or (video.get("selection_metrics") or {}).get("tier", 1) > 1,
                 "alternatives": [{"name": row[3].get("name", row[3]["path"]),
-                                  "source_word": row[4]["word"], "score": round(row[0], 4)}
+                                  "source_word": row[4].get("word"), "score": round(row[0], 4)}
                                  for row in sorted(ranked, key=lambda row: -row[0])[:3]]}
     return chosen, evidence
 

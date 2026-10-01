@@ -99,7 +99,7 @@ def test_english_i_matches_vietnamese_ai_even_when_reused(word):
     chosen, evidence = choose_audio(pool, {"in_sec": 10, "out_sec": 11}, info,
                                    Counter({"ai.wav": 50, "aii.wav": 50}), recent=pool[1:])
     assert chosen["category"] == "AI"
-    assert evidence["method"] == "source-audio-whisper-exact-word"
+    assert evidence["method"] == "source-audio-pronunciation"
 
 
 def test_visual_fallback_avoids_recent_word_variants_and_marks_review():

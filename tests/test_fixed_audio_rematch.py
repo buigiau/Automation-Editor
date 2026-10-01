@@ -20,7 +20,7 @@ def test_rematch_changes_only_samples_and_preserves_all_scene_track_bindings():
     before = saved_plan()
     before["cubase_slots"][0]["cubase"]["custom_routing"] = "Keep this output"
     snapshot = copy.deepcopy(before)
-    info = {"source_speech": {"words": [{"word": "I", "start": .5, "end": .7, "prob": .95}]}}
+    info = {"source_speech": {"words": [{"word": "I", "start": .1, "end": .3, "prob": .95}]}}
     result = rematch_fixed_slots(before, [{"path": "ai.wav", "category": "AI", "duration_sec": .3}], info)
     assert before == snapshot
     assert result["operation_scope"] == "sample_assignment_only"

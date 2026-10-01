@@ -81,3 +81,42 @@ def test_broken_asr_is_not_cached_as_a_silent_source(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="model unavailable"):
         speech.transcribe_source(path, [(0, 1)], tmp_path / "cache")
     assert not list((tmp_path / "cache").glob("*.json"))
+
+
+def test_full_scan_chunks_have_bounded_audio_and_one_owner_per_boundary_word(tmp_path, monkeypatch):
+    path = tmp_path / "long.wav"
+    sf.write(path, np.full(16000*130, .2), 16000)
+    calls = []
+    boundary = 58.0
+
+    class FakeModel:
+        def transcribe(self, samples, **kwargs):
+            start = calls[-1][0]
+            if start <= boundary < start+len(samples)/16000:
+                good = NS(text="know", no_speech_prob=.01, words=[
+                    NS(word="know", start=boundary-start, end=boundary-start+.3, probability=.97)])
+                return iter([good]), NS()
+            return iter([]), NS()
+
+    def decode(container, stream, origin, start, end):
+        calls.append((start, end))
+        return np.full(round((end-start)*16000), .2, np.float32)
+
+    monkeypatch.setattr(speech, "_model", lambda name: FakeModel())
+    monkeypatch.setattr(speech, "_decode_window", decode)
+    result = speech.transcribe_source(path, [(0, 130)], tmp_path / "cache")
+    assert len(calls) == 3
+    assert all(end-start <= 60 for start, end in calls)
+    assert result["words"] == [{"word": "know", "start": 58.0, "end": 58.3, "prob": .97}]
+
+
+def test_vocal_event_detector_keeps_source_offset_and_excludes_spoken_words(monkeypatch):
+    from autoedit.audio import source_events
+    monkeypatch.setattr(source_events, "_cluster_runs", lambda *a: [(10, 40, "single")])
+    monkeypatch.setattr(source_events, "acoustic_category", lambda feat: "COUGH")
+    samples = np.full(16000, .2, np.float32)
+    events = source_events.detect_vocal_events(samples, 16000, [], offset=5)
+    assert events[0]["action"] == "COUGH" and events[0]["start"] == pytest.approx(5.1)
+    assert events[0]["needs_review"]
+    assert not source_events.detect_vocal_events(samples, 16000,
+        [{"word": "hello", "start": 5.0, "end": 5.5, "prob": .99}], offset=5)

@@ -10,9 +10,10 @@ from autoedit.audio.analyzer import analyze_audio_dir
 from autoedit.audio.segments import expand_match_units
 from autoedit.audio.taxonomy import item_group
 from autoedit.audio.source_speech import transcribe_source
+from autoedit.audio.pronunciation import build_sound_anchors
 from autoedit.audio.review import write_audio_review
 from autoedit.cubase.adapter import apply_cubase_plan
-from autoedit.match.matcher import match_slots_to_video
+from autoedit.match.matcher import InsufficientFootageError, match_slots_to_video
 from autoedit.plan.generator import build_edit_plan
 from autoedit.premiere.adapter import write_apply_payload
 from autoedit.premiere.prproj import inspect_prproj
@@ -177,14 +178,49 @@ def _run_pipeline(config: dict[str, Any], log: Log | None = None) -> dict[str, A
         _log(log, "Intro: existing opening content is preserved; no intro will be added.")
     else:
         _log(log, f"Intro: empty lead-in of {intro['required_duration_sec']:.3f}s will be filled.")
-    _log(log, "Reserving longest cuts first, keeping template order; visible people and stable openings required for every cut.")
+    _log(log, "Checking that full-duration cuts and intro can fit before source-audio analysis.")
     matches = match_slots_to_video(slots, [], video_info,
                                    min_gap_sec=float(video_cfg.get("source_gap_sec", 5.0)))
+    visual_matches = matches
+    if intro and intro["status"] == "empty":
+        match_slots_to_video([intro], [], video_info,
+                            min_gap_sec=float(video_cfg.get("source_gap_sec", 5.0)),
+                            excluded_ranges=[(m["video"]["in_sec"], m["video"]["out_sec"]) for m in matches])
+    analyzed = min(float(video_info["duration_sec"]),
+                   float(video_info.get("analyzed_seconds") or video_info["duration_sec"]))
+    _log(log, f"Scanning source audio across 0-{analyzed:.3f}s before selecting sound-led cuts.")
+    speech = transcribe_source(source_media, [(0.0, analyzed)], out / "video_cache",
+                               model=video_cfg.get("speech_model") or "small",
+                               language=video_cfg.get("speech_language", "en"),
+                               progress=lambda m: _log(log, "  " + m))
+    (out / "source_transcript.json").write_text(json.dumps(speech, indent=2, ensure_ascii=False), encoding="utf-8")
+    video_info["source_speech"] = speech
+    video_info["sound_anchors"] = build_sound_anchors(audio_items, speech)
+    (out / "source_sound_matches.json").write_text(
+        json.dumps(video_info["sound_anchors"], indent=2, ensure_ascii=False), encoding="utf-8")
+    _log(log, f"  library-matched sound onsets={len(video_info['sound_anchors'])}; retaining slot lengths and source gaps")
+    _log(log, f"  high-confidence onsets={sum(a['confidence_tier'] == 1 for a in video_info['sound_anchors'])}; "
+              f"remaining supported onsets need listening review")
+    if video_info["sound_anchors"]:
+        matches = match_slots_to_video(slots, [], video_info,
+                                       min_gap_sec=float(video_cfg.get("source_gap_sec", 5.0)))
+        if intro and intro["status"] == "empty":
+            try:
+                match_slots_to_video([intro], [], dict(video_info, sound_anchors=[]),
+                                     min_gap_sec=float(video_cfg.get("source_gap_sec", 5.0)),
+                                     excluded_ranges=[(m["video"]["in_sec"], m["video"]["out_sec"]) for m in matches])
+            except InsufficientFootageError:
+                matches = visual_matches
+                _log(log, "Sound-led cuts left no qualifying intro; using the verified visual allocation.")
+    notes.append("Cuts prefer library-matched sound onsets; each scene uses the WAV matching its opening sound. Unmatched cuts use visual/neutral fallback.")
     for slot, match in zip(slots, matches):
         selected = match["video"]
         metrics = selected.get("selection_metrics") or {}
         _log(log, f"  clip {slot.get('nested_sequence')}: source {selected['in_sec']:.3f}-{selected['out_sec']:.3f}s "
                   f"tier={metrics.get('tier')} clear_face={metrics.get('clear_face', 0):.2f} speaking={metrics.get('speaking', 0):.2f}")
+        if selected.get("source_sound"):
+            sound = selected["source_sound"]
+            _log(log, f"    opening sound={sound.get('word') or sound.get('action')} at {sound['start']:.3f}s")
         if selected.get("character_selection"):
             character = selected["character_selection"]
             _log(log, f"    character={character['decision']} ids={character['character_ids']} "
@@ -200,7 +236,7 @@ def _run_pipeline(config: dict[str, Any], log: Log | None = None) -> dict[str, A
     )
     plan["template_audio_tracks"] = inspect.get("template_audio_tracks", [])
     if intro and intro["status"] == "empty":
-        extra = match_slots_to_video([intro], [], video_info,
+        extra = match_slots_to_video([intro], [], dict(video_info, sound_anchors=[]),
                     min_gap_sec=float(video_cfg.get("source_gap_sec", 5.0)),
                     excluded_ranges=[(m["video"]["in_sec"], m["video"]["out_sec"]) for m in matches])[0]["video"]
         plan["intro_fill"] = {"slot_id": "intro", "mode": "intro_gap",
@@ -215,12 +251,6 @@ def _run_pipeline(config: dict[str, Any], log: Log | None = None) -> dict[str, A
     plan["project"]["video_only_source"] = prepare_video_only_source(
         source_media, out / "video_only", progress=lambda m: _log(log, "  " + m))
     plan["audio_mode"] = "sampler_per_scene_v1"
-    speech = transcribe_source(source_media,
-                               [(s["video"]["in_sec"], s["video"]["out_sec"]) for s in plan["slots"]],
-                               out / "video_cache", model=video_cfg.get("speech_model") or "small",
-                               language=video_cfg.get("speech_language", "en"),
-                               progress=lambda m: _log(log, "  " + m))
-    (out / "source_transcript.json").write_text(json.dumps(speech, indent=2, ensure_ascii=False), encoding="utf-8")
     readable_slots = [s for s in plan["slots"] if s["video"]["selection_metrics"]["tier"] <= 2]
     lip_info = (refine_selected_cuts(source_media, readable_slots, out / "video_cache", source_kind=source_kind,
                                    character_samples=video_info.get("samples") if video_info.get("character_analysis") else None,
