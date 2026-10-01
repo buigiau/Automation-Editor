@@ -1,0 +1,3 @@
+# Use scripts/setup_gpu.py, which repairs the shared ONNX files after resolving
+# faster-whisper's dependency on the CPU ONNX distribution.
+-e .[gpu]

@@ -38,7 +38,7 @@ def test_word_timestamps_and_cache_invalidate_by_range_settings_and_source(tmp_p
             silence = NS(text="What?", no_speech_prob=.95, words=good.words)
             return iter([good, hallucinated, silence]), NS()
 
-    monkeypatch.setattr(speech, "_model", lambda name: FakeModel())
+    monkeypatch.setattr(speech, "_model", lambda name, **kwargs: FakeModel())
     first = speech.transcribe_source(path, [(5, 6)], tmp_path / "cache")
     assert first["has_audio"]
     assert first["words"] == [{"word": "What?", "start": 5.25, "end": 5.5, "prob": .97}]
@@ -74,7 +74,7 @@ def test_broken_asr_is_not_cached_as_a_silent_source(tmp_path, monkeypatch):
     path = tmp_path / "source.wav"
     sf.write(path, np.full(32000, .2), 16000)
 
-    def broken(name):
+    def broken(name, **kwargs):
         raise RuntimeError("model unavailable")
 
     monkeypatch.setattr(speech, "_model", broken)
@@ -102,7 +102,7 @@ def test_full_scan_chunks_have_bounded_audio_and_one_owner_per_boundary_word(tmp
         calls.append((start, end))
         return np.full(round((end-start)*16000), .2, np.float32)
 
-    monkeypatch.setattr(speech, "_model", lambda name: FakeModel())
+    monkeypatch.setattr(speech, "_model", lambda name, **kwargs: FakeModel())
     monkeypatch.setattr(speech, "_decode_window", decode)
     result = speech.transcribe_source(path, [(0, 130)], tmp_path / "cache")
     assert len(calls) == 3
@@ -120,3 +120,24 @@ def test_vocal_event_detector_keeps_source_offset_and_excludes_spoken_words(monk
     assert events[0]["needs_review"]
     assert not source_events.detect_vocal_events(samples, 16000,
         [{"word": "hello", "start": 5.0, "end": 5.5, "prob": .99}], offset=5)
+
+
+def test_transcript_cache_distinguishes_device_precision_and_records_execution(tmp_path, monkeypatch):
+    path = tmp_path / "speech.wav"
+    sf.write(path, np.full(32000, .2), 16000)
+    calls = []
+
+    def model(name, **kwargs):
+        calls.append(kwargs)
+        return NS(execution={"device": kwargs["device"], "compute_type": kwargs["compute_type"]},
+                  transcribe=lambda *a, **kw: (iter([]), NS()))
+
+    monkeypatch.setattr(speech, "_model", model)
+    cpu = speech.transcribe_source(path, [(0, 1)], tmp_path / "cache", device="cpu")
+    gpu = speech.transcribe_source(path, [(0, 1)], tmp_path / "cache", device="cuda")
+    fp16 = speech.transcribe_source(path, [(0, 1)], tmp_path / "cache", device="cuda", compute_type="float16")
+    assert cpu["execution"]["device"] == "cpu"
+    assert gpu["execution"]["device"] == "cuda"
+    assert fp16["execution"]["compute_type"] == "float16"
+    assert speech.transcribe_source(path, [(0, 1)], tmp_path / "cache", device="cpu") == cpu
+    assert len(calls) == 3

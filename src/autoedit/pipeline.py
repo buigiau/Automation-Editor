@@ -192,6 +192,9 @@ def _run_pipeline(config: dict[str, Any], log: Log | None = None) -> dict[str, A
     speech = transcribe_source(source_media, [(0.0, analyzed)], out / "video_cache",
                                model=video_cfg.get("speech_model") or "small",
                                language=video_cfg.get("speech_language", "en"),
+                               device=video_cfg.get("speech_device", "auto"),
+                               compute_type=video_cfg.get("speech_compute_type", "auto"),
+                               device_index=video_cfg.get("speech_device_index", 0),
                                progress=lambda m: _log(log, "  " + m))
     (out / "source_transcript.json").write_text(json.dumps(speech, indent=2, ensure_ascii=False), encoding="utf-8")
     video_info["source_speech"] = speech

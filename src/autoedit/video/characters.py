@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 
 from autoedit.video.embeddings import EmbeddingModel, fingerprint, model_path
+from autoedit.acceleration import device_settings
 
 CHARACTER_VERSION = 1
 DEFAULTS = {
@@ -21,11 +22,13 @@ DEFAULTS = {
     "arcface_model": "", "ccip_model": "", "arcface_cosine_distance": .35,
     "ccip_cosine_distance": .20, "max_track_gap_sec": .5,
     "embeddings_per_track": 8, "min_cluster_seconds": 3.0, "min_cluster_shots": 2,
+    "device": "auto", "device_index": 0,
 }
 
 
 def settings(config=None):
     result = {**DEFAULTS, **(config or {})}
+    device_settings(result["device"], result["device_index"])
     if not isinstance(result["enabled"], bool):
         raise ValueError("video.characters.enabled must be true or false")
     for key in ("coverage_target", "min_main_fraction"):
@@ -272,25 +275,35 @@ def analyze_characters(video_info, cache_dir, config=None, progress=None):
     path = model_path(kind, config)
     identity = {"source": video_info.get("cache_identity"), "model_sha256": fingerprint(path),
                 "source_kind": kind, "version": CHARACTER_VERSION,
+                "device": config["device"], "device_index": config["device_index"],
                 "max_track_gap_sec": config["max_track_gap_sec"], "embeddings_per_track": config["embeddings_per_track"]}
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     cache = Path(cache_dir) / f"characters-{key}.json.gz"
     info = deepcopy(video_info)
     tracks = None
+    execution = None
     if cache.is_file():
         try:
             data = json.loads(gzip.decompress(cache.read_bytes()))
             if data.get("identity") == identity:
                 tracks = data["tracks"]
+                execution = data.get("execution")
                 if progress:
                     progress("Character embedding cache hit: no crop decode or model inference")
         except (OSError, ValueError, EOFError, KeyError):
             pass
     if tracks is None:
-        tracks = _extract_tracks(info, config, EmbeddingModel(kind, config), progress)
+        model = EmbeddingModel(kind, config)
+        if progress:
+            progress(f"Character runtime: {getattr(model, 'execution', None)}")
+        tracks = _extract_tracks(info, config, model, progress)
+        execution = getattr(model, "execution", None)
+        if progress and execution and execution.get("fallback_reason"):
+            progress(f"Character runtime: CPU fallback: {execution['fallback_reason']}")
         cache.parent.mkdir(parents=True, exist_ok=True)
         temporary = cache.with_suffix(".tmp")
-        temporary.write_bytes(gzip.compress(json.dumps({"identity": identity, "tracks": tracks}).encode()))
+        temporary.write_bytes(gzip.compress(json.dumps({"identity": identity, "tracks": tracks,
+                                                       "execution": execution}).encode()))
         temporary.replace(cache)
     threshold = config["ccip_cosine_distance" if kind == "animation" else "arcface_cosine_distance"]
     clusters, by_track, achieved = rank_characters(tracks, config, threshold)
@@ -316,6 +329,7 @@ def analyze_characters(video_info, cache_dir, config=None, progress=None):
     from autoedit.video.faces import annotate_speaking
     annotate_speaking(info["samples"], kind)
     info["character_analysis"] = {"version": CHARACTER_VERSION, "model_sha256": identity["model_sha256"],
+        "execution": execution,
         "model_path": str(path), "embedding_model": "ccip" if kind == "animation" else "arcface",
         "clustering": "complete-link-cosine-with-cooccurrence-constraints", "cosine_distance": threshold,
         "coverage_target": config["coverage_target"], "coverage_achieved": achieved,

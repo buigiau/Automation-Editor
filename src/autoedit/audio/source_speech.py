@@ -12,15 +12,108 @@ from pathlib import Path
 
 import numpy as np
 
+from autoedit.acceleration import device_settings, is_accelerator_error, prepare_nvidia_runtime
 from autoedit.audio.detail import _is_hallucination
 
-ASR_VERSION = 2
+ASR_VERSION = 3
 _MODELS = {}
 
 
-def _model(name):
-    if name not in _MODELS:
+class _WhisperRuntime:
+    def __init__(self, path, device, compute_type, device_index, progress=None):
+        prepare_nvidia_runtime()
         from faster_whisper import WhisperModel
+        import ctranslate2
+        self.path = path
+        self.requested_device = device
+        self.requested_compute_type = compute_type
+        self.device_index = device_index
+        self.progress = progress
+        self.fallback_reason = None
+        self.factory = WhisperModel
+        self.device = device
+        if device != "cpu":
+            try:
+                available = ctranslate2.get_cuda_device_count() > device_index
+            except RuntimeError as exc:
+                if device == "cuda":
+                    raise
+                available = False
+                self.fallback_reason = str(exc)
+            if available:
+                self.device = "cuda"
+            elif device == "cuda":
+                raise RuntimeError(f"CUDA device {device_index} is unavailable")
+            else:
+                self.device = "cpu"
+                self.fallback_reason = self.fallback_reason or "No usable CUDA device"
+        self.compute_type = self._precision(self.device)
+        try:
+            self.model = self._load()
+        except Exception as exc:
+            if self.device != "cuda" or device != "auto" or not is_accelerator_error(exc):
+                raise
+            self._fallback(exc)
+        self._report()
+
+    def _precision(self, device):
+        if self.requested_compute_type != "auto":
+            if device == "cpu" and self.requested_device == "auto":
+                import ctranslate2
+                if self.requested_compute_type not in ctranslate2.get_supported_compute_types("cpu"):
+                    return "int8"
+            return self.requested_compute_type
+        return "int8_float16" if device == "cuda" else "int8"
+
+    def _load(self):
+        return self.factory(self.path, device=self.device, compute_type=self.compute_type,
+                            device_index=self.device_index if self.device == "cuda" else 0)
+
+    def _report(self):
+        if self.progress:
+            message = f"Whisper runtime: {self.device}, {self.compute_type}"
+            if self.fallback_reason:
+                message += f"; CPU fallback: {self.fallback_reason}"
+            self.progress(message)
+
+    def _fallback(self, error):
+        import gc
+        self.model = None
+        gc.collect()
+        self.device = "cpu"
+        # A GPU-only precision requested in auto mode must not break CPU recovery.
+        self.compute_type = self._precision("cpu")
+        self.fallback_reason = str(error)
+        self.model = self._load()
+
+    @property
+    def execution(self):
+        return {"device": self.device, "compute_type": self.compute_type,
+                "device_index": self.device_index if self.device == "cuda" else None,
+                "fallback_reason": self.fallback_reason}
+
+    def transcribe(self, samples, **kwargs):
+        # faster-whisper defers GPU work until its segments iterator is consumed.
+        # Discard a partial chunk and rerun it once on CPU; never duplicate words.
+        try:
+            segments, info = self.model.transcribe(samples, **kwargs)
+            return iter(list(segments)), info
+        except Exception as exc:
+            if self.device != "cuda" or self.requested_device != "auto" or not is_accelerator_error(exc):
+                raise
+            self._fallback(exc)
+            self._report()
+            segments, info = self.model.transcribe(samples, **kwargs)
+            return iter(list(segments)), info
+
+
+def _model(name, device="auto", compute_type="auto", device_index=0, progress=None):
+    device_settings(device, device_index)
+    if compute_type not in {"auto", "int8", "int8_float16", "int8_float32", "float16", "float32", "bfloat16", "int8_bfloat16"}:
+        raise ValueError("Unsupported Whisper compute_type")
+    key = (name, device, compute_type, device_index)
+    if key not in _MODELS:
+        prepare_nvidia_runtime()
         from faster_whisper.utils import download_model
         from huggingface_hub.errors import LocalEntryNotFoundError
         cache = str(Path(__file__).resolve().parents[3] / "models" / "whisper")
@@ -34,8 +127,11 @@ def _model(name):
                     pass
             if resolved is None:
                 resolved = download_model(name, cache_dir=cache)
-        _MODELS[name] = WhisperModel(resolved, device="cpu", compute_type="int8")
-    return _MODELS[name]
+        _MODELS[key] = _WhisperRuntime(resolved, device, compute_type, device_index, progress)
+    else:
+        _MODELS[key].progress = progress
+        _MODELS[key]._report()
+    return _MODELS[key]
 
 
 def _windows(ranges, padding=1.0):
@@ -90,18 +186,21 @@ def _chunks(windows, size=60.0, context=1.0):
             core = edge
 
 
-def transcribe_source(path, ranges, cache_dir, model="small", language="en", progress=None):
+def transcribe_source(path, ranges, cache_dir, model="small", language="en", progress=None,
+                      device="auto", compute_type="auto", device_index=0):
     """Return absolute source word timestamps; silent sources have no words.
 
     Missing/broken ASR is an explicit error, never a successful silent fallback.
     Set language=None to auto-detect for non-English source videos.
     """
     import av
+    device_settings(device, device_index)
     src = Path(path).resolve()
     stat = src.stat()
     windows = _windows(ranges)
     identity = {"path": str(src), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
-                "windows": windows, "model": model, "language": language, "version": ASR_VERSION}
+                "windows": windows, "model": model, "language": language, "version": ASR_VERSION,
+                "device": device, "compute_type": compute_type, "device_index": device_index}
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     dest = Path(cache_dir) / ("speech-" + key + ".json")
     if dest.is_file():
@@ -129,9 +228,12 @@ def transcribe_source(path, ranges, cache_dir, model="small", language="en", pro
                 samples = _decode_window(container, stream, origin, start, end)
                 if not len(samples) or float(np.max(np.abs(samples))) < 1e-4:
                     continue
-                segments, _ = _model(model).transcribe(
+                runtime = _model(model, device=device, compute_type=compute_type,
+                                 device_index=device_index, progress=progress)
+                segments, _ = runtime.transcribe(
                     samples, language=language, beam_size=5, word_timestamps=True,
                     vad_filter=True, condition_on_previous_text=False, temperature=0.0)
+                result["execution"] = getattr(runtime, "execution", None)
                 chunk_words = []
                 for segment in segments:
                     if segment.no_speech_prob > 0.6 or _is_hallucination(segment.text):
