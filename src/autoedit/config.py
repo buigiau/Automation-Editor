@@ -23,7 +23,7 @@ DEFAULTS: dict[str, Any] = {
         "video_track_index": 1,
         "import_mixdown": True,
     },
-    "audio": {"directory": r"C:\Users\giaubv\Downloads\Voice-20261001T032653Z-1-001\Voice", "glob": "*.wav", "files": [], "max_files": 0},
+    "audio": {"directory": r"D:\Editor\Voice", "glob": "*.wav", "files": [], "max_files": 0},
     "video": {
         "sample_fps": 6,
         "max_seconds": 0,

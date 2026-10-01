@@ -15,7 +15,7 @@ premiere:
   import_mixdown: true
 
 audio:
-  directory: 'C:\Users\giaubv\Downloads\Voice-20261001T032653Z-1-001\Voice'
+  directory: 'D:\Editor\Voice'
   glob: "*.wav"
   files: []
   max_files: 0
