@@ -1,8 +1,9 @@
-"""Whisper word timestamps from the selected source-video cuts.
+"""Whisper word timestamps from source-video ranges, including a full scan.
 
 Decode the original soundtrack with PyAV, preserving its offset relative to
-video time. Context around each cut helps ASR; only words inside a selected cut
-can be matched. Cache identity includes source stat, ranges and ASR settings.
+video time. Bounded overlapping context supports full-video scans. Word and
+event timestamps drive cut-onset candidates; cache identity includes source
+stat, ranges, detector version and ASR settings.
 """
 import hashlib
 import json
@@ -13,7 +14,7 @@ import numpy as np
 
 from autoedit.audio.detail import _is_hallucination
 
-ASR_VERSION = 1
+ASR_VERSION = 2
 _MODELS = {}
 
 
@@ -76,6 +77,19 @@ def _decode_window(container, stream, origin, start, end):
     return audio
 
 
+def _chunks(windows, size=60.0, context=1.0):
+    """Bound memory for long videos; overlapping context has one owner per word."""
+    for lo, hi in windows:
+        if hi-lo <= size:
+            yield lo, hi, lo, hi
+            continue
+        core = lo
+        while core < hi:
+            edge = min(core+size-2*context, hi)
+            yield max(lo, core-context), min(hi, edge+context), core, edge
+            core = edge
+
+
 def transcribe_source(path, ranges, cache_dir, model="small", language="en", progress=None):
     """Return absolute source word timestamps; silent sources have no words.
 
@@ -99,7 +113,7 @@ def transcribe_source(path, ranges, cache_dir, model="small", language="en", pro
                 return cached
         except (ValueError, OSError):
             pass
-    result = {"has_audio": False, "words": [], "method": "whisper-source-audio",
+    result = {"has_audio": False, "words": [], "events": [], "method": "whisper-source-audio",
               "model": model, "language": language, "cache_identity": identity}
     with av.open(str(src)) as container:
         if container.streams.audio:
@@ -107,15 +121,18 @@ def transcribe_source(path, ranges, cache_dir, model="small", language="en", pro
             stream = container.streams.audio[0]
             video = container.streams.video[0] if container.streams.video else stream
             origin = float(video.start_time * video.time_base) if video.start_time is not None else 0.0
-            for index, (start, end) in enumerate(windows, 1):
+            chunks = list(_chunks(windows))
+            from autoedit.audio.source_events import detect_vocal_events
+            for index, (start, end, core_start, core_end) in enumerate(chunks, 1):
                 if progress:
-                    progress(f"Whisper source audio {index}/{len(windows)}: {start:.2f}-{end:.2f}s")
+                    progress(f"Whisper source audio {index}/{len(chunks)}: {start:.2f}-{end:.2f}s")
                 samples = _decode_window(container, stream, origin, start, end)
                 if not len(samples) or float(np.max(np.abs(samples))) < 1e-4:
                     continue
                 segments, _ = _model(model).transcribe(
                     samples, language=language, beam_size=5, word_timestamps=True,
                     vad_filter=True, condition_on_previous_text=False, temperature=0.0)
+                chunk_words = []
                 for segment in segments:
                     if segment.no_speech_prob > 0.6 or _is_hallucination(segment.text):
                         continue
@@ -123,12 +140,18 @@ def transcribe_source(path, ranges, cache_dir, model="small", language="en", pro
                         a, b, prob = float(word.start), float(word.end), float(word.probability)
                         if not all(math.isfinite(v) for v in (a, b, prob)) or not 0 <= a < b <= end-start+0.05:
                             continue
-                        result["words"].append({"word": word.word.strip(), "start": round(start+a, 4),
-                                                "end": round(start+b, 4), "prob": prob})
+                        chunk_words.append({"word": word.word.strip(), "start": round(start+a, 4),
+                                            "end": round(start+b, 4), "prob": prob})
+                result["words"].extend(w for w in chunk_words
+                                       if core_start <= (w["start"]+w["end"])/2 < core_end)
+                result["events"].extend(e for e in detect_vocal_events(samples, 16000, chunk_words, start)
+                                        if core_start <= (e["start"]+e["end"])/2 < core_end)
     result["words"].sort(key=lambda word: word["start"])
-    result["status"] = "transcribed" if result["words"] else ("no-speech" if result["has_audio"] else "no-audio")
+    result["events"].sort(key=lambda event: event["start"])
+    result["status"] = ("transcribed" if result["words"] else "vocal-events" if result["events"]
+                        else "no-speech" if result["has_audio"] else "no-audio")
     if progress:
-        progress(f"Source speech: {result['status']}, {len(result['words'])} words")
+        progress(f"Source speech: {result['status']}, {len(result['words'])} words, {len(result['events'])} vocal-event hints")
     dest.parent.mkdir(parents=True, exist_ok=True)
     temp = dest.with_suffix(".tmp")
     temp.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")

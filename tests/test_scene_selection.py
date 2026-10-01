@@ -121,13 +121,13 @@ def test_animation_neutral_policy_does_not_treat_unknown_as_neutral():
         select_audio_for_source(items[:2], "animation")
 
 
-@pytest.mark.parametrize("source_word", [None, "What"])
-def test_animation_pipeline_prioritizes_source_word_then_neutral(tmp_path, monkeypatch, source_word):
+@pytest.mark.parametrize("source_word,stem", [(None, "what"), ("What", "what"), ("I", "ai"), ("know", "no2")])
+def test_animation_pipeline_prioritizes_source_word_then_neutral(tmp_path, monkeypatch, source_word, stem):
     import wave
     import autoedit.pipeline as pipeline
     from test_nested_fills import fixture_project
     neutral = tmp_path / "hi.wav"
-    reaction = tmp_path / "what.wav"
+    reaction = tmp_path / (stem+".wav")
     for path in (neutral, reaction):
         with wave.open(str(path), "wb") as wav:
             wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(8000)
@@ -136,9 +136,9 @@ def test_animation_pipeline_prioritizes_source_word_then_neutral(tmp_path, monke
     monkeypatch.setattr(pipeline, "refine_selected_cuts", lambda *a, **kw: {})
     monkeypatch.setattr(pipeline, "write_audio_review", lambda *a, **kw: None)
     def source_speech(path, ranges, *args, **kwargs):
-        start = ranges[0][0]
-        return {"has_audio": True, "words": [{"word": source_word, "start": start+.01,
-                 "end": start+.15, "prob": .95}] if source_word else []}
+        assert ranges == [(0.0, 30.0)]  # Scan before choosing final cuts.
+        return {"has_audio": True, "words": [{"word": source_word, "start": 6.13,
+                 "end": 6.3, "prob": .95}] if source_word else []}
     monkeypatch.setattr(pipeline, "transcribe_source", source_speech)
     monkeypatch.setattr(pipeline, "prepare_video_only_source", lambda *a, **kw: "video-only.mov")
     monkeypatch.setattr(pipeline, "inspect_sampler_tracks", lambda path: {
@@ -155,8 +155,12 @@ def test_animation_pipeline_prioritizes_source_word_then_neutral(tmp_path, monke
     assert len(plan["slots"]) == 1
     assert len(plan["cubase_slots"]) == 1
     assert all(s["audio"]["path"] == str(reaction if source_word else neutral) for s in plan["cubase_slots"])
-    expected = "source-audio-whisper-exact-word" if source_word else "neutral-no-readable-viseme"
+    expected = ("source-audio-pronunciation" if source_word in {"know", "I"} else
+                "source-audio-whisper-exact-word" if source_word else "neutral-no-readable-viseme")
     assert all(s["audio_match"]["method"] == expected for s in plan["cubase_slots"])
+    if source_word:
+        assert plan["slots"][0]["video"]["in_sec"] == 6.13
+        assert all(s["audio"]["placement_offset_sec"] == 0 for s in plan["cubase_slots"])
     if not source_word:
         assert all(s["audio"]["audio_style"] == "NEUTRAL" for s in plan["cubase_slots"])
     assert plan["project"]["import_mixdown"] is False

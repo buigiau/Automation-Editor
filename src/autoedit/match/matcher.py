@@ -75,6 +75,11 @@ def match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requir
                                          excluded_ranges, min_tier, level)
         except InsufficientFootageError as exc:
             last_error = exc
+    if video_info.get("sound_anchors"):
+        # A preferred onset can fragment valid footage. Retry the original
+        # visual allocation rather than fail a job that can still be filled.
+        return match_slots_to_video(slots, audio_items, dict(video_info, sound_anchors=[]),
+                                    min_gap_sec, require_speaking, excluded_ranges, min_tier)
     raise last_error
 
 
@@ -163,6 +168,7 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
     anchors.update(float(s["start_sec"]) for s in segments)
     anchors.update(t + .16 for t in transitions)
     anchors.update(float(t) for t in np.linspace(0, duration, min(2001, int(duration) + 2)))
+    sound_by_start = {float(s["start"]): s for s in video_info.get("sound_anchors", [])}
     free = [(0.0, duration)]
     used = []
     matches = [None] * len(slots)
@@ -207,6 +213,10 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
                 continue
             candidates.update((left, max(left, right - need), max(left, min(target - need / 2, right - need))))
             candidates.update(max(left, min(t, right - need)) for t in anchors if left <= t < right)
+            # Never clamp a sound onset to fit a window: that would cut into
+            # another sound while keeping the original WAV assignment.
+            candidates.update(t for t, sound in sound_by_start.items()
+                              if left <= t and t+need <= right+1e-8 and sound["end"] <= t+need)
         ranked = []
         for start in candidates:
             end = start + need
@@ -249,6 +259,8 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
             score = quality + category_bonus + 0.8 * spread + 0.8 * diversity
             ranked.append((score, start, seg, measured))
         ranked.sort(key=lambda row: (
+            sound_by_start[row[1]].get("confidence_tier", 1)
+            if row[1] in sound_by_start and sound_by_start[row[1]]["end"] <= row[1]+need else 3,
             {"main": 0, "uncertain": 1, "supporting": 2}.get(
                 row[3].get("character_selection", {}).get("decision"), 0),
             row[3]["transition_count"], row[3]["tier"] if require_speaking else max(2, row[3]["tier"]),
@@ -264,12 +276,16 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
         score, start, seg, metrics, free = chosen
         end = start + need
         used.append((start, end))
+        sound = sound_by_start.get(start)
+        if sound and sound["end"] > end:
+            sound = None
         matches[i] = {"audio": audio, "video": {**seg, "in_sec": start, "out_sec": end,
+                        **({"source_sound": sound} if sound else {}),
                         "used_duration_sec": need, "selection_metrics": metrics,
                         **({"character_selection": metrics["character_selection"]}
                            if "character_selection" in metrics else {}),
                         "source_gap_sec": gap}, "score": round(score, 4),
-                        "status": "matched" if same_family((audio or {}).get("category"), seg.get("category")) else "fallback"}
+                        "status": "sound_matched" if sound else "matched" if same_family((audio or {}).get("category"), seg.get("category")) else "fallback"}
     return matches
 
 
