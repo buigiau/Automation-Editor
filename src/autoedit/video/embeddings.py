@@ -127,12 +127,18 @@ class EmbeddingModel:
             image = cv2.warpAffine(frame, transform, (self.size, self.size))
         else:
             # Include hair/head cues, while rejecting crops containing another face.
-            left, top = max(0, int(x - .35 * w)), max(0, int(y - .55 * h))
-            right, bottom = min(width, int(x + 1.35 * w)), min(height, int(y + 1.2 * h))
+            if face.get('subject_kind') == 'object':
+                ox,oy,ow,oh=face['subject_box']
+                x,y,w,h=ox*sx,oy*sy,ow*sx,oh*sy
+                left,top=max(0,int(x-.08*w)),max(0,int(y-.08*h))
+                right,bottom=min(width,int(x+1.08*w)),min(height,int(y+1.08*h))
+            else:
+                left, top = max(0, int(x - .35 * w)), max(0, int(y - .55 * h))
+                right, bottom = min(width, int(x + 1.35 * w)), min(height, int(y + 1.2 * h))
             for other in other_faces:
                 if other is face:
                     continue
-                ox, oy, ow, oh = other["face"]
+                ox, oy, ow, oh = other.get('track_box',other['face'])
                 if left < (ox + ow / 2) * sx < right and top < (oy + oh / 2) * sy < bottom:
                     return None
             crop = frame[top:bottom, left:right]

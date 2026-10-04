@@ -9,7 +9,7 @@ premiere:
   project: ""
   source_sequence: ""          # unused; source is the selected video file
   template_sequence: "PJ 5 - demo"
-  source_media: ""
+  source_media: ""           # one path or a list: ["video1.mp4", "video2.mp4"]
   slot_mode: nested_sequences
   video_track_index: 1
   import_mixdown: true
@@ -33,10 +33,17 @@ video:
   speech_compute_type: auto  # CUDA: int8_float16; CPU: int8
   speech_device_index: 0
   speech_language: en  # null enables language detection
+  require_lip_motion: false  # clear character shots; true requires verified moving mouths
+  object_detection:
+    enabled: auto  # use the installed whole-character model; false keeps face/pose only
+    device: auto
+    threshold: 0.3
   characters:
     enabled: true
+    main_group: auto  # automatic exposure ranking; legacy yellow_minions also uses automatic ranking
     device: auto
     device_index: 0
+    embedding_model: auto  # retry appearance features when human face identities fragment
     coverage_target: 0.75
     min_main_fraction: 0.85
     arcface_model: ""  # default: models/characters/arcface.onnx
@@ -48,6 +55,7 @@ cubase:
   project: ""
   track_name_pattern: "Sampler Track {index:02d}"
   sampler_track_count: 16
+  sampler_tracks: ""  # blank keeps existing mapping; use "2-13" to skip sampler 1
   sample_rate: 48000
   channels: 2
 

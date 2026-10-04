@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from autoedit.video.mouth import classify_mouth, roi_metrics
+from autoedit.video.pool import bounded_segments
 
 
 def _try_cv2():
@@ -76,11 +77,14 @@ def _visual_quality(cv2, frame, det, previous_gray=None, previous_det=None):
         x, y, fw, fh = det["face"]
         closeup = min(1.0, max(0, fw * fh) / max(1, w * h) / 0.22)
         mx, my, mw, mh = det.get("mouth_box") or [x, y + int(fh * 0.55), fw, int(fh * 0.45)]
-        crop = gray[max(0, my):min(h, my + mh), max(0, mx):min(w, mx + mw)]
+        # The visible outline is the sharp evidence for a smooth cartoon mouth.
+        # A closed one-pixel lip has no interior texture; include its actual edge.
+        pad = max(1, round(min(mw,mh)*.15)) if det.get('backend') == 'animation-eyes-mouth' and mw > 0 and mh > 0 else 0
+        crop = gray[max(0, my-pad):min(h, my + mh+pad), max(0, mx-pad):min(w, mx + mw+pad)]
         if crop.size:
             sharpness = min(1.0, float(cv2.Laplacian(crop, cv2.CV_64F).var()) / 150)
             visible = float(mx >= 0 and my >= 0 and mx + mw <= w and my + mh <= h)
-            reliability = 1.0 if det.get("backend") == "mediapipe-landmarks" else 0.55
+            reliability = 1.0 if det.get("backend") in {"mediapipe-landmarks", "animation-eyes-mouth"} else 0.55
             clarity = sharpness * visible * reliability * float(det.get("frontal_score", 1))
     mouth_activity = 0.0
     if face_detected and previous_det and previous_det.get("face_detected") and motion < 0.3:
@@ -152,7 +156,7 @@ def _merge_segments(
     return segments
 
 
-ANALYSIS_VERSION = 10
+ANALYSIS_VERSION = 15
 
 
 def analyze_video(
@@ -165,6 +169,7 @@ def analyze_video(
     progress: Callable[[str], None] | None = None,
     cache_dir: str | Path | None = None,
     source_kind: str = "live_action",
+    main_group: str = "auto",
 ) -> dict[str, Any]:
     import gzip
     import hashlib
@@ -181,6 +186,10 @@ def analyze_video(
         raise ValueError("Unknown video backend")
     if source_kind not in {"live_action", "animation"}:
         raise ValueError("Unknown video source kind")
+    if main_group not in {"auto", "yellow_minions"}:
+        raise ValueError("Unknown main character group")
+    if main_group == "yellow_minions" and (source_kind != "animation" or backend == "opencv"):
+        raise ValueError("Yellow Minions require animation with the auto/mediapipe backend")
     src = Path(path).resolve()
     stat = src.stat()
     identity = {"path": str(src), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
@@ -189,6 +198,10 @@ def analyze_video(
                 "backend": backend, "source_kind": source_kind, "version": ANALYSIS_VERSION,
                 "pose_model_mtime": POSE_MODEL_PATH.stat().st_mtime_ns if POSE_MODEL_PATH.is_file() else None,
                 "model_mtime": MODEL_PATH.stat().st_mtime_ns if MODEL_PATH.is_file() else None}
+    if main_group != "auto":
+        identity.update(main_group=main_group, main_group_version=4)
+    if source_kind == 'animation':
+        identity['animation_detector_version'] = 7
     cache = None
     if cache_dir:
         key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
@@ -197,6 +210,8 @@ def analyze_video(
             try:
                 info = json.loads(gzip.decompress(cache.read_bytes()))
                 if info.get("cache_identity") == identity:
+                    analyzed_end = min(float(info["duration_sec"]), float(info["analyzed_seconds"]))
+                    info["segments"] = bounded_segments(info.get("segments", []), analyzed_end, min_segment_sec)
                     if progress:
                         progress("Video analysis cache hit: reusing face/lip samples; no video rescan.")
                     return info
@@ -208,8 +223,11 @@ def analyze_video(
     if backend != "opencv":
         # Fail explicitly: missing/broken landmarks must never fall back to a scene crop.
         try:
-            detector = MultiRegionFaceLandmarker() if source_kind == "animation" else FaceLandmarker()
-            pose = PoseLandmarker()
+            detector = ((MultiRegionFaceLandmarker() if main_group == "auto" else
+                         MultiRegionFaceLandmarker(main_group=main_group))
+                        if source_kind == "animation" else MultiRegionFaceLandmarker(include_animation=False))
+            if main_group == "auto":
+                pose = PoseLandmarker()
         except ImportError as exc:
             if detector:
                 detector.close()
@@ -231,17 +249,38 @@ def analyze_video(
     cap.release()
     limit = duration if max_seconds <= 0 else min(duration, max_seconds)
     if progress:
-        progress(f"Video scan: {duration / 60:.1f} min, {sample_fps:g} samples/s, sequential decoder, backend={'mediapipe-landmarks' if detector else 'opencv-diagnostic'}")
+        detector_name = ("minion-goggles-mouth" if main_group == "yellow_minions" else
+                         "mediapipe-landmarks" if detector else "opencv-diagnostic")
+        progress(f"Video scan: {duration / 60:.1f} min, {sample_fps:g} samples/s, sequential decoder, backend={detector_name}")
     started = last_report = time.perf_counter()
     samples = []
     backends = Counter()
     previous_gray = previous_det = None
     from autoedit.video.transitions import TransitionDetector
     transitions = TransitionDetector()
-    frames = sampled_frames(src, sample_fps, limit, transition_detector=transitions)
+    from autoedit.video.tracking import FaceFeatureTracker
+    tracker = FaceFeatureTracker()
+    previous_sample_time = -1.
+    def track_between_samples(t, decoded):
+        if not detector or not tracker.faces:
+            return
+        width = 640
+        if decoded.width > width:
+            decoded = decoded.reformat(width=width, height=max(2,round(decoded.height*width/decoded.width)),format='bgr24')
+        tracker.update(decoded.to_ndarray(format='bgr24'), t, [],
+                       cut=any(tracker.last_time < event <= t for event in transitions.events))
+    frames = sampled_frames(src, sample_fps, limit, transition_detector=transitions,
+                            between_samples=track_between_samples)
     try:
         for t, frame in frames:
             det = detector.detect(frame, t) if detector else _detect_opencv(cv2, np, frame)
+            if detector:
+                faces = tracker.update(frame,t,det.get('faces',[]),
+                    cut=any(previous_sample_time < event <= t for event in transitions.events))
+                if faces:
+                    subject = max(faces,key=lambda face:face['face'][2]*face['face'][3])
+                    det = {**subject,'faces':faces,'face_candidate_count':len(faces)}
+            previous_sample_time = t
             quality, previous_gray = _visual_quality(cv2, frame, det, previous_gray, previous_det)
             det.update(quality)
             det["frame_width"] = int(frame.shape[1])
@@ -276,10 +315,12 @@ def analyze_video(
         progress(f"Video done in {elapsed:.1f}s: clear-face samples={sum(s['clear_face'] for s in samples):.0f}, speaking samples={sum(s['speaking'] for s in samples):.0f}")
     info = {"path": str(src), "duration_sec": duration, "fps": fps, "sample_fps": sample_fps,
             "analyzed_seconds": actual_end, "backend_counts": dict(backends), "sample_count": len(samples),
-            "segments": _merge_segments(samples, min_segment_sec, merge_gap_sec, sample_interval=1 / sample_fps),
-            "samples": samples, "source_kind": source_kind, "quality_method": "multiface-lips-independent-pose-v7",
+            "segments": bounded_segments(
+                _merge_segments(samples, min_segment_sec, merge_gap_sec, sample_interval=1 / sample_fps),
+                actual_end, min_segment_sec),
+            "samples": samples, "source_kind": source_kind, "quality_method": "multiregion-verified-face-tracks-v9",
             "analysis_elapsed_sec": round(elapsed, 3), "cache_identity": identity,
-            "transition_times_sec": sorted(set(transitions.events)), "transition_method": "frame-hsv-discontinuity-v3",
+            "transition_times_sec": sorted(set(transitions.events)), "transition_method": "motion-verified-shot-local-v4",
             "shot_times_sec": sorted(set(transitions.shot_events)), "shot_method": "adjacent-frame-histogram-v1"}
     if cache:
         cache.parent.mkdir(parents=True, exist_ok=True)

@@ -6,6 +6,7 @@ from autoedit.match.matcher import same_family
 from autoedit.audio.selection import select_audio_for_source
 from autoedit.audio.taxonomy import TAXONOMY, item_group
 from autoedit.audio.pronunciation import VoiceIndex, source_sounds, valid_sound
+from autoedit.cubase.inspect import parse_sampler_tracks
 
 WORD_SHAPES = {sound.label: sound.visemes[0] for _, sound in TAXONOMY.values()
                if sound.visemes and sound.action == "SPEECH" and sound.label not in {"A", "E", "O", "U"}}
@@ -34,7 +35,9 @@ def _source_word_audio(candidates, video, video_info, used):
         # The first sound blocks all later words, even if it is unsupported or
         # uncertain. A cut through a word must not match the following word.
         sounds = [s for s in source_sounds(video_info.get("source_speech", {}))
-                  if s["start"] < end and s["end"] > start]
+                  if s["start"] < end and s["end"] > start
+                  and not ((video.get("selection_metrics") or {}).get("require_lip_motion")
+                           and s.get("action") and s.get("prob", 0) < .85)]
         if not sounds:
             return None
         sound = sounds[0]
@@ -91,13 +94,20 @@ def choose_audio(candidates, video, video_info, used, recent=()):
     """
     import numpy as np
 
+    samples = [s for s in video_info.get("samples", [])
+               if video["in_sec"] <= s["time_sec"] < video["out_sec"] and s.get("clear_face")]
+    strict = (video.get("selection_metrics") or {}).get("require_lip_motion")
+    if strict:
+        from autoedit.video.faces import lip_motion_evidence
+        if not samples:
+            raise ValueError("Selected speaking cut has no readable lips in dense analysis; regenerate/review this cut instead of assigning an unrelated neutral WAV.")
+        if not lip_motion_evidence(samples):
+            raise ValueError("Selected speaking cut has no visible lip movement in dense analysis; cannot assign a voice to a static face.")
     exact = _source_word_audio(candidates, video, video_info, used)
     if exact:
         return exact
     candidates = select_audio_for_source(candidates, video_info.get("source_kind", "live_action"))
-    samples = [s for s in video_info.get("samples", [])
-               if video["in_sec"] <= s["time_sec"] < video["out_sec"] and s.get("clear_face")]
-    if not samples or (video.get("selection_metrics") or {}).get("tier", 1) >= 3:
+    if not strict and (not samples or (video.get("selection_metrics") or {}).get("tier", 1) >= 3):
         return _coarse_audio(candidates, video, video_info, used)
     duration = video["out_sec"] - video["in_sec"]
     speaking = [s for s in samples if s.get("speaking")]
@@ -201,7 +211,10 @@ def _coarse_audio(candidates, video, video_info, used):
 
 def build_sampler_slots(scenes, video_slots, candidates, video_info, inventory):
     tracks = inventory["tracks"]
-    if [t["index"] for t in tracks] != list(range(1, len(scenes)+1)):
+    expected = parse_sampler_tracks(inventory.get("selected_track_indices"))
+    if expected is None:
+        expected = list(range(1, len(scenes)+1))
+    if len(tracks) != len(scenes) or [t["index"] for t in tracks] != expected:
         raise ValueError(f"Premiere has {len(scenes)} scene runs but Cubase sampler tracks are "
                          f"{[t['index'] for t in tracks]}; exact ordered mapping is required (no wraparound).")
     parents = {s["premiere"]["nested_sequence_uid"]: s for s in video_slots}

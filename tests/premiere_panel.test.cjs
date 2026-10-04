@@ -69,6 +69,15 @@ function setup(format = 'payload', options = {}) {
     },
   };
   rootItems.push(source);
+  const secondSource = { name: 'second-video-only.mov', currentIn: tick(3), currentOut: tick(55),
+    getMediaFilePath: async () => 'C:/second-video-only.mov',
+    getInPoint: async () => options.unreadableSecond ? null : secondSource.currentIn,
+    getOutPoint: async () => secondSource.currentOut,
+    createSetInOutPointsAction: (start, end) => () => {
+      secondSource.currentIn = start; secondSource.currentOut = end;
+    },
+  };
+  if (options.multiple) rootItems.push(secondSource);
   rootItems.push({ name: 'source.mp4', hasAudio: true, getMediaFilePath: async () => 'C:/source.mp4' });
   const project = {
     getSequences: async () => [template, ...nests, { name: '1', guid: 'unused' }],
@@ -97,10 +106,28 @@ function setup(format = 'payload', options = {}) {
     overwrite_at_sec: 0, slot_duration_sec: 1, end_sec: 1, video_track_index: 1, audio_track_index: -1 };
   if (options.characters && options.intro) payload.intro_fill.character_selection = {
     ...actions[0].character_selection, decision: 'uncertain', reason: 'uncertain-character-identity' };
+  if (options.multiple) {
+    payload.source_videos = [
+      { path: 'C:/source.mp4', duration_sec: 100, video_only_source: 'C:/video-only.mov' },
+      { path: 'C:/second.mp4', duration_sec: 60, video_only_source: 'C:/second-video-only.mov' },
+    ];
+    actions.forEach((action, i) => {
+      const entry = payload.source_videos[i < 7 ? 0 : 1];
+      Object.assign(action, { source_media: entry.path, video_only_source: entry.video_only_source,
+        source_duration_sec: entry.duration_sec, in_sec: (i % 7) * 4, out_sec: (i % 7) * 4 + 4 });
+    });
+    if (payload.intro_fill) Object.assign(payload.intro_fill, {
+      source_video: 'C:/second.mp4', video_only_source: 'C:/second-video-only.mov',
+      source_duration_sec: 60, in_sec: 40, out_sec: 41,
+    });
+  }
   const fullPlan = { intro_fill: payload.intro_fill, template_audio_tracks: payload.template_audio_tracks,
-    project: { template_sequence: template.name, source_video: 'C:/source.mp4', video_only_source: 'C:/video-only.mov' },
+    project: { template_sequence: template.name, source_video: 'C:/source.mp4', video_only_source: 'C:/video-only.mov',
+      source_videos: payload.source_videos },
     video_analysis_meta: { duration_sec: 100 }, slots: actions.map(a => ({ id: a.slot_id,
-      video: { in_sec: a.in_sec, out_sec: a.out_sec, character_selection: a.character_selection }, premiere: {
+      source_video: a.source_media,
+      video: { in_sec: a.in_sec, out_sec: a.out_sec, character_selection: a.character_selection,
+        video_only_source: a.video_only_source, source_duration_sec: a.source_duration_sec }, premiere: {
         mode: a.mode, nested_sequence: a.nested_sequence, nested_sequence_uid: a.nested_sequence_uid,
         duration_sec: 4, instances, video_track_index: 1, fill_video_track_index: 0,
       } })) };
@@ -133,8 +160,8 @@ function setup(format = 'payload', options = {}) {
           return () => { mixEdits.push({ dest, item, time, v, a, start, end }); audioTracks[a] = [audioItem(mixClip)]; };
         }
         if (options.failOverwriteAt === edits.length) throw Error('overwrite rejected');
-        const start = sourceIn.seconds;
-        const end = sourceOut.seconds;
+        const start = item === secondSource ? secondSource.currentIn.seconds : sourceIn.seconds;
+        const end = item === secondSource ? secondSource.currentOut.seconds : sourceOut.seconds;
         return () => {
           edits.push({ dest, item, time, v, a, start, end });
           // Simulate a host routing a source's audio to A1 despite a=-1.
@@ -165,12 +192,169 @@ function setup(format = 'payload', options = {}) {
     console: { log: () => {} },
   });
   vm.runInContext(fs.readFileSync('plugins/premiere-uxp/main.js', 'utf8'), context);
-  return { context, edits, cuts, payload, source, mixEdits, removed, imports, audioTracks, markers,
+  return { context, edits, cuts, payload, fullPlan, project, template, nests, tick, source, secondSource, mixEdits, removed, imports, audioTracks, markers,
     refreshCount: () => refreshCount, mixMarks: () => [mixIn.seconds, mixOut.seconds],
     filePickerCalls: () => filePickerCalls,
     marks: () => [sourceIn.seconds, sourceOut.seconds],
     load: () => context.loadPlan() };
 }
+
+for (const format of ['payload', 'plan']) {
+  test(`multiple sources fill from each file and restore all source marks via ${format}`, async () => {
+    const env = setup(format, { multiple: true, intro: true });
+    await env.load();
+    await env.context.applyNestedPlan();
+    assert.equal(env.edits.length, 15);
+    assert.equal(env.edits.filter(e => e.item === env.source).length, 7);
+    assert.equal(env.edits.filter(e => e.item === env.secondSource).length, 8);
+    assert.deepEqual(env.marks(), [7, 97]);
+    assert.equal(env.secondSource.currentIn.seconds, 3);
+    assert.equal(env.secondSource.currentOut.seconds, 55);
+    assert.equal(env.edits[7].start, 0);
+    assert.equal(env.edits[7].end, 4);
+    assert.equal(env.edits[14].start, 40);
+    assert.equal(env.edits[14].dest, env.template);
+  });
+}
+
+test('unreadable second source marks abort before any fill', async () => {
+  const env = setup('payload', { multiple: true, unreadableSecond: true });
+  await env.load();
+  await assert.rejects(env.context.applyNestedPlan(), /Could not read source/);
+  assert.equal(env.edits.length, 0);
+  assert.deepEqual(env.marks(), [7, 97]);
+});
+
+test('multiple sources restore both marks after a later overwrite fails', async () => {
+  const env = setup('payload', { multiple: true, failOverwriteAt: 8 });
+  await env.load();
+  await assert.rejects(env.context.applyNestedPlan(), /Fill failed after 8 nests/);
+  assert.deepEqual(env.marks(), [7, 97]);
+  assert.equal(env.secondSource.currentIn.seconds, 3);
+  assert.equal(env.secondSource.currentOut.seconds, 55);
+});
+
+test('a range exceeding its own source duration aborts before any fill', async () => {
+  const env = setup('payload', { multiple: true });
+  env.payload.fill_nested_sequences[13].in_sec = 58;
+  env.payload.fill_nested_sequences[13].out_sec = 62;
+  await env.load();
+  await assert.rejects(env.context.applyNestedPlan(), /Invalid or incomplete source range/);
+  assert.equal(env.edits.length, 0);
+});
+
+test('missing per-action source cannot fall back to the first video', async () => {
+  const env = setup('payload', { multiple: true });
+  delete env.payload.fill_nested_sequences[13].video_only_source;
+  await env.load();
+  await assert.rejects(env.context.applyNestedPlan(), /Missing video-only source/);
+  assert.equal(env.edits.length, 0);
+});
+
+function recursiveSetup(format = 'payload') {
+  const env = setup(format);
+  const { template, nests, tick } = env;
+  template.name = 'BEAT MAU';
+  const [a, b] = nests;
+  a.name = '4'; b.name = '5';
+  const item = row => ({
+    getProjectItem: async () => ({ isSequence: async () => true, getSequence: async () => row.sequence }),
+    getStartTime: async () => tick(row.start_sec), getEndTime: async () => tick(row.end_sec),
+    getInPoint: async () => tick(row.source_in_sec), getOutPoint: async () => tick(row.source_out_sec),
+  });
+  const inner = [
+    { sequence: a, start_sec: 0, end_sec: 2, source_in_sec: 3, source_out_sec: 5 },
+    { sequence: a, start_sec: 2, end_sec: 4, source_in_sec: 0, source_out_sec: 2 },
+  ];
+  const wrapper = { name: 'Nested Sequence 17', guid: 'wrap',
+    getVideoTrackCount: async () => 2,
+    getVideoTrack: async index => ({ getTrackItems: async () => index === 1 ? inner.map(item) : [] }),
+    getAudioTrackCount: async () => 0 };
+  const rootTracks = [[], [
+    { sequence: wrapper, start_sec: 10, end_sec: 12, source_in_sec: 1, source_out_sec: 3 },
+    { sequence: b, start_sec: 12, end_sec: 13, source_in_sec: 0, source_out_sec: 1 },
+  ], [], [{ sequence: a, start_sec: 12, end_sec: 12.5, source_in_sec: .5, source_out_sec: 1 }]];
+  template.getVideoTrackCount = async () => rootTracks.length;
+  template.getVideoTrack = async index => ({ getTrackItems: async () => rootTracks[index].map(item) });
+  env.project.getSequences = async () => [template, wrapper, a, b];
+  const structure = [
+    ...rootTracks.map((rows, index) => ({ sequence_uid: 'main', sequence_name: template.name,
+      video_track_index: index, instances: rows.map(({ sequence, ...row }) => ({ ...row, nested_sequence_uid: String(sequence.guid) })) })),
+    ...[[], inner].map((rows, index) => ({ sequence_uid: 'wrap', sequence_name: wrapper.name,
+      video_track_index: index, instances: rows.map(({ sequence, ...row }) => ({ ...row, nested_sequence_uid: String(sequence.guid) })) })),
+  ];
+  const instances = [
+    [{ start_sec: 10, end_sec: 11, source_in_sec: 4, source_out_sec: 5, template_video_track_index: 1 },
+     { start_sec: 11, end_sec: 12, source_in_sec: 0, source_out_sec: 1, template_video_track_index: 1 },
+     { start_sec: 12, end_sec: 12.5, source_in_sec: .5, source_out_sec: 1, template_video_track_index: 3 }],
+    [{ start_sec: 12, end_sec: 13, source_in_sec: 0, source_out_sec: 1, template_video_track_index: 1 }],
+  ];
+  env.payload.template_sequence = template.name;
+  env.payload.nested_structure = structure;
+  env.payload.fill_nested_sequences = env.payload.fill_nested_sequences.slice(0, 2).map((action, i) => ({
+    ...action, nested_sequence: [a, b][i].name, instances: instances[i],
+    in_sec: i * 10, out_sec: i * 10 + [5, 1][i], slot_duration_sec: [5, 1][i] }));
+  env.fullPlan.project.template_sequence = template.name;
+  env.fullPlan.nested_structure = structure;
+  env.fullPlan.slots = env.payload.fill_nested_sequences.map(action => ({ id: action.slot_id,
+    video: { in_sec: action.in_sec, out_sec: action.out_sec }, premiere: {
+      mode: 'nested_sequence', nested_sequence: action.nested_sequence, nested_sequence_uid: action.nested_sequence_uid,
+      duration_sec: action.slot_duration_sec, instances: action.instances, video_track_index: 1 } }));
+  return { ...env, wrapper, inner, rootTracks };
+}
+
+for (const format of ['payload', 'plan']) {
+  test(`recursive fills resolve leaves and preserve wrapper cuts via ${format}`, async () => {
+    const env = recursiveSetup(format);
+    const saved = env.inner.map(i => [i.start_sec, i.end_sec, i.source_in_sec, i.source_out_sec]);
+    await env.load(); await env.context.applyPlan();
+    assert.equal(env.edits.length, 2);
+    assert.deepEqual(env.edits.map(e => e.dest.name), ['4', '5']);
+    assert(env.edits.every(e => e.v === 0 && e.time.seconds === 0));
+    assert.deepEqual(env.inner.map(i => [i.start_sec, i.end_sec, i.source_in_sec, i.source_out_sec]), saved);
+    assert.deepEqual(env.marks(), [7, 97]);
+  });
+  test(`changed inner nest is rejected before any fill via ${format}`, async () => {
+    const env = recursiveSetup(format);
+    env.inner[1].source_in_sec = .1;
+    await env.load();
+    await assert.rejects(env.context.applyPlan(), /Nested structure differs/);
+    assert.equal(env.edits.length, 0); assert.equal(env.cuts.length, 0);
+  });
+}
+test('changed V4 overlay is rejected before any recursive fill', async () => {
+  const env = recursiveSetup();
+  env.rootTracks[3][0].end_sec = 12.6;
+  await env.load();
+  await assert.rejects(env.context.applyPlan(), /Nested structure differs/);
+  assert.equal(env.edits.length, 0);
+});
+test('incomplete recursive track snapshots are rejected', async () => {
+  const env = recursiveSetup();
+  env.payload.nested_structure.splice(2, 1); // Missing root V3.
+  await env.load();
+  await assert.rejects(env.context.applyPlan(), /Nested track count differs/);
+  assert.equal(env.edits.length, 0);
+});
+test('legacy wrapper-target plan is rejected despite its empty V1', async () => {
+  const env = recursiveSetup();
+  env.payload.nested_structure = null;
+  env.payload.fill_nested_sequences = [{ ...env.payload.fill_nested_sequences[0],
+    nested_sequence: env.wrapper.name, nested_sequence_uid: 'wrap',
+    instances: [{ start_sec: 10, end_sec: 12, source_in_sec: 1, source_out_sec: 3 }] }];
+  await env.load();
+  await assert.rejects(env.context.applyPlan(), /Fill target contains nested cuts/);
+  assert.equal(env.edits.length, 0); assert.equal(env.cuts.length, 0);
+});
+test('recursive review markers use global timing including V4 instances', async () => {
+  const env = recursiveSetup();
+  env.payload.fill_nested_sequences[0].character_selection = {
+    decision: 'supporting', needs_review: true, reason: 'supporting-character-fallback' };
+  await env.load(); await env.context.applyPlan();
+  const owned = env.markers.filter(m => m.name.startsWith('AUTOEDIT_CHARACTER:'));
+  assert.deepEqual(owned.map(m => m.start.seconds), [10, 11, 12]);
+  assert.deepEqual(owned.map(m => m.duration.seconds), [1, 1, .5]);
+});
 
 for (const format of ['payload', 'plan']) {
   test(`character review marks repeated instances and intro without duplication via ${format}`, async () => {

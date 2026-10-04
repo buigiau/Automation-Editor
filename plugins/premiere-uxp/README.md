@@ -14,6 +14,9 @@ Updating the plugin: Unload then Load the plugin in UXP Developer Tool. If the o
 
 ## Placement
 
+- Multilevel nests are resolved to their footage sequences. For Zoomally, `BEAT MAU -> Nested Sequence 17 -> 4` fills `4` on V1, preserving the cuts on V2 of `Nested Sequence 17`. Shared leaves on other root tracks (including V4) are filled once by GUID. The panel verifies every saved wrapper/root reference before editing and refuses legacy plans targeting wrappers.
+- Existing single-level templates use the original track/slot logic. If `PJ 5 - demo` is absent, Python can select the only unreferenced sequence with nests on the configured video track; ambiguous roots require an explicit `premiere.template_sequence`. Regenerate the plan and reload the panel for multilevel projects.
+- Audio scenes follow the configured root video track, with nested source offsets and wrapper trims mapped onto the main timeline. Overlay tracks contribute video fills and review markers, without creating extra sampler tracks. Retimed nested clips require an explicit timing map and are rejected by the multilevel inspector.
 - One source range per referenced nested-sequence GUID (14 in both reference projects).
 - If there is an empty lead-in before scene 1, one separate `intro_fill` fills that gap with video only. Soda Pop uses 0–1s. It adds no nested sequence or audio assignment and does not move later clips. All video tracks are checked for occupied content before editing.
 - Each range covers the nested V1 footage duration and every existing repeat's source out point.

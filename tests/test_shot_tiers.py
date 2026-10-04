@@ -177,3 +177,34 @@ def test_pose_model_change_invalidates_video_cache(tmp_path, monkeypatch):
     assert first["cache_identity"]["pose_model_mtime"] is None
     assert second["cache_identity"]["pose_model_mtime"] == model.stat().st_mtime_ns
     assert all("person_detected" in s for s in second["samples"])
+
+
+def test_analysis_bounds_tail_segments_and_reuses_older_cache(tmp_path, monkeypatch):
+    import gzip
+    import json
+    from test_talking_faces import make_video
+    import autoedit.video.analyzer as analyzer
+
+    path = make_video(tmp_path)
+    cache_dir = tmp_path / "cache"
+    # Stop in the middle of the final sample interval.
+    first = analyzer.analyze_video(path, backend="opencv", max_seconds=1.03,
+                                   cache_dir=cache_dir)
+    assert first["segments"]
+    assert all(0 <= s["start_sec"] < s["end_sec"] <= 1.03 for s in first["segments"])
+    assert first["segments"][-1]["end_sec"] == pytest.approx(1.03)
+
+    # Simulate the segment metadata stored by the old code without changing samples.
+    cache_path = next(cache_dir.glob("*.json.gz"))
+    cached = json.loads(gzip.decompress(cache_path.read_bytes()))
+    cached["segments"][-1]["end_sec"] = 1.167
+    cache_path.write_bytes(gzip.compress(json.dumps(cached).encode()))
+
+    def no_rescan():
+        pytest.fail("Fixing cached segment bounds must not rescan the video")
+
+    monkeypatch.setattr(analyzer, "_try_cv2", no_rescan)
+    second = analyzer.analyze_video(path, backend="opencv", max_seconds=1.03,
+                                    cache_dir=cache_dir)
+    assert second["segments"] == first["segments"]
+    assert second["samples"] == first["samples"]

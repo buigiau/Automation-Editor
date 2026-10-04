@@ -125,7 +125,9 @@ async function loadPlan() {
       source_video: (data.project || {}).source_video || (data.project || {}).source_media,
       source_media: (data.project || {}).source_video || (data.project || {}).source_media,
       video_only_source: (data.project || {}).video_only_source,
+      source_videos: (data.project || {}).source_videos,
       template_audio_tracks: data.template_audio_tracks,
+      nested_structure: data.nested_structure,
       import_source_video: true,
       save_project: false,
       mixdown_wav: (data.mixdown || {}).path,
@@ -145,7 +147,9 @@ async function loadPlan() {
             instances: prem.instances || [],
             template_video_track_index: prem.video_track_index,
             template_sequence: (data.project || {}).template_sequence,
-            source_media: (data.project || {}).source_video || (data.project || {}).source_media,
+            source_media: s.source_video || (data.project || {}).source_video || (data.project || {}).source_media,
+            video_only_source: s.video.video_only_source || (data.project || {}).video_only_source,
+            source_duration_sec: s.video.source_duration_sec || (data.video_analysis_meta || {}).duration_sec,
             source_start_sec: s.source_start_sec != null ? s.source_start_sec : s.video.in_sec,
             source_end_sec: s.source_end_sec != null ? s.source_end_sec : s.video.out_sec,
             in_sec: s.source_start_sec != null ? s.source_start_sec : s.video.in_sec,
@@ -355,6 +359,77 @@ async function verifyTemplateInstances(template, actions) {
   }
 }
 
+async function verifyNestedStructure(template, actions, sequences, structure) {
+  if (!Array.isArray(structure) || !structure.length) throw new Error("Missing nested structure; regenerate the plan");
+  const byUid = new Map(sequences.map(s => [normalizedGuid(s.guid), s]));
+  const graph = new Map(), tracks = new Map();
+  for (const snapshot of structure) {
+    const uid = normalizedGuid(snapshot.sequence_uid);
+    const sequence = byUid.get(uid), index = Number(snapshot.video_track_index);
+    if (!sequence || !Number.isInteger(index) || index < 0 || !Array.isArray(snapshot.instances)) {
+      throw new Error("Invalid nested structure; regenerate the plan");
+    }
+    if (!tracks.has(uid)) tracks.set(uid, new Set());
+    if (tracks.get(uid).has(index)) throw new Error("Duplicate nested track snapshot");
+    tracks.get(uid).add(index);
+    if (index >= await sequence.getVideoTrackCount()) throw new Error("Nested track missing: " + sequence.name);
+    const actual = [];
+    for (const item of await clipTrackItems(sequence, index)) {
+      const clip = ppro.ClipProjectItem.cast(await item.getProjectItem());
+      if (!clip || !(await clip.isSequence())) continue;
+      const child = await clip.getSequence();
+      actual.push({ nested_sequence_uid: normalizedGuid(child.guid),
+        start_sec: await readTickSeconds(item, "getStartTime"),
+        end_sec: await readTickSeconds(item, "getEndTime"),
+        source_in_sec: await readTickSeconds(item, "getInPoint"),
+        source_out_sec: await readTickSeconds(item, "getOutPoint") });
+    }
+    const expected = snapshot.instances.map(i => ({ ...i, nested_sequence_uid: normalizedGuid(i.nested_sequence_uid) }));
+    const order = (a, b) => a.start_sec - b.start_sec || a.nested_sequence_uid.localeCompare(b.nested_sequence_uid);
+    actual.sort(order); expected.sort(order);
+    if (actual.length !== expected.length || actual.some((item, i) =>
+      item.nested_sequence_uid !== expected[i].nested_sequence_uid ||
+      ["start_sec", "end_sec", "source_in_sec", "source_out_sec"].some(key =>
+        !Number.isFinite(expected[i][key]) || !Number.isFinite(item[key]) ||
+        Math.abs(item[key] - expected[i][key]) > 0.000001))) {
+      throw new Error("Nested structure differs from plan in " + sequence.name + " V" + (index + 1) + ". Regenerate the plan.");
+    }
+    if (!graph.has(uid)) graph.set(uid, new Set());
+    for (const item of actual) graph.get(uid).add(item.nested_sequence_uid);
+  }
+  for (const [uid, indices] of tracks) {
+    if (indices.size !== await byUid.get(uid).getVideoTrackCount()) {
+      throw new Error("Nested track count differs from plan: " + byUid.get(uid).name);
+    }
+  }
+  const reachable = new Set();
+  function visit(uid, ancestors) {
+    if (ancestors.has(uid)) throw new Error("Cyclic nested structure");
+    if (reachable.has(uid)) return;
+    reachable.add(uid);
+    const next = new Set(ancestors); next.add(uid);
+    for (const child of graph.get(uid) || []) visit(child, next);
+  }
+  const root = normalizedGuid(template.guid);
+  if (!graph.has(root)) throw new Error("Template missing from nested structure");
+  visit(root, new Set());
+  if (actions.some(a => !reachable.has(normalizedGuid(a.nested_sequence_uid)) ||
+      (graph.get(normalizedGuid(a.nested_sequence_uid)) || new Set()).size)) {
+    throw new Error("Nested fills must target reachable footage sequences; regenerate the plan");
+  }
+}
+
+async function verifyFootageLeaf(sequence) {
+  for (let index = 0; index < await sequence.getVideoTrackCount(); index++) {
+    for (const item of await clipTrackItems(sequence, index)) {
+      const clip = ppro.ClipProjectItem.cast(await item.getProjectItem());
+      if (clip && await clip.isSequence()) {
+        throw new Error("Fill target contains nested cuts: " + sequence.name + ". Regenerate the plan for footage sequences.");
+      }
+    }
+  }
+}
+
 async function snapshotAudio(sequence) {
   const tracks = [];
   for (let index = 0; index < await sequence.getAudioTrackCount(); index++) {
@@ -414,6 +489,32 @@ async function applyPlan() {
   }
 }
 
+function fillSourceFor(action) {
+  const multiple = (applyDoc.source_videos || []).length > 1;
+  const path = action.video_only_source || (!multiple && applyDoc.video_only_source);
+  if (!path) throw new Error("Missing video-only source for " + action.slot_id + "; regenerate the plan");
+  if (multiple && !applyDoc.source_videos.some(s =>
+      s.video_only_source === path && s.path === action.source_media)) {
+    // Intro actions carry source_video instead of source_media.
+    if (!applyDoc.source_videos.some(s => s.video_only_source === path && s.path === action.source_video)) {
+      throw new Error("Unknown source for " + action.slot_id + "; regenerate the plan");
+    }
+  }
+  return path;
+}
+
+function sourceDurationFor(action) {
+  if ((applyDoc.source_videos || []).length > 1) {
+    const path = fillSourceFor(action);
+    const source = applyDoc.source_videos.find(s => s.video_only_source === path);
+    if (Number(action.source_duration_sec) !== Number(source.duration_sec)) {
+      throw new Error("Inconsistent source duration for " + action.slot_id);
+    }
+    return Number(source.duration_sec);
+  }
+  return Number(action.source_duration_sec || applyDoc.source_duration_sec);
+}
+
 async function applyNestedPlan() {
   if (!applyDoc || applyDoc.fill_policy !== "nested_sequences_v2") {
     throw new Error("Regenerate edit-plan.json with the updated tool before applying.");
@@ -430,7 +531,11 @@ async function applyNestedPlan() {
   verifyConfiguredAudio(templateAudio, applyDoc.template_audio_tracks);
   const all = applyDoc.fill_nested_sequences || [];
   if (!all.length) throw new Error("Plan has no nested fills");
-  await verifyTemplateInstances(template, all);
+  if (applyDoc.nested_structure != null) {
+    await verifyNestedStructure(template, all, sequences, applyDoc.nested_structure);
+  } else {
+    await verifyTemplateInstances(template, all);
+  }
   const seen = new Set();
   const prepared = [];
   // Validate every destination and range before importing or editing anything.
@@ -442,10 +547,12 @@ async function applyNestedPlan() {
     seen.add(uid);
     const dest = sequences.find(s => normalizedGuid(s.guid) === uid);
     if (!dest || dest === template) throw new Error("Nested sequence not found: " + action.nested_sequence);
+    await verifyFootageLeaf(dest);
     const start = Number(action.in_sec);
     const end = Number(action.out_sec);
     const duration = Number(action.slot_duration_sec);
-    const mediaDuration = Number(applyDoc.source_duration_sec);
+    fillSourceFor(action);
+    const mediaDuration = sourceDurationFor(action);
     if (action.in_sec == null || !Number.isFinite(start) || start < 0 ||
         !Number.isFinite(end) || !Number.isFinite(duration) || duration <= 0 ||
         Math.abs(end - start - duration) > 0.000001 ||
@@ -467,12 +574,15 @@ async function applyNestedPlan() {
   if (!prepared.length) throw new Error("No matching nested sequence in plan");
   const intro = applyDoc.intro_fill;
   if (intro) {
+    fillSourceFor(intro);
+    const introDuration = sourceDurationFor(intro);
     const start = Number(intro.in_sec), end = Number(intro.out_sec);
     const length = Number(intro.slot_duration_sec), track = Number(intro.video_track_index);
     if (intro.mode !== "intro_gap" || intro.overwrite_at_sec !== 0 ||
         !Number.isFinite(start) || start < 0 || !Number.isFinite(end) ||
         !Number.isFinite(length) || length <= 0 || Math.abs(end - start - length) > 1e-6 ||
-        Math.abs(Number(intro.end_sec) - length) > 1e-6 || end > Number(applyDoc.source_duration_sec) ||
+        Math.abs(Number(intro.end_sec) - length) > 1e-6 || !Number.isFinite(introDuration) ||
+        introDuration <= 0 || end > introDuration ||
         !Number.isInteger(track) || track < 0 || track >= await template.getVideoTrackCount() ||
         intro.audio_track_index !== -1) throw new Error("Invalid intro fill; regenerate the plan");
     const firstScene = Math.min(...all.flatMap(a => a.instances.map(i => i.start_sec)));
@@ -487,7 +597,7 @@ async function applyNestedPlan() {
           if (t !== track || await item.isAdjustmentLayer() ||
               await readTickSeconds(item, "getStartTime") !== 0 ||
               Math.abs(await readTickSeconds(item, "getEndTime") - length) > 1e-6 ||
-              ![applyDoc.video_only_source, applyDoc.source_video, applyDoc.source_media]
+              ![intro.video_only_source, intro.source_video, applyDoc.video_only_source, applyDoc.source_video, applyDoc.source_media]
                 .filter(Boolean).some(p => path === toForwardSlashPath(p).toLowerCase())) {
             throw new Error("Intro gap contains existing content; no clips were changed");
           }
@@ -497,27 +607,34 @@ async function applyNestedPlan() {
     prepared.push({ action: {...intro, nested_sequence: "intro"}, dest: template, start, end });
   }
   const characterMarkers = await prepareCharacterMarkers(template, all, intro);
-  const source = await ensureSourceClip(project, applyDoc.video_only_source);
   // These source-mark APIs are available in 26.0.2. Save marks before touching them.
   const mediaType = ppro.Constants.MediaType.VIDEO;
-  const savedIn = await source.clipItem.getInPoint(mediaType);
-  const savedOut = await source.clipItem.getOutPoint(mediaType);
-  if (!savedIn || savedIn.ticks == null || !savedOut || savedOut.ticks == null) {
-    throw new Error("Could not read source in/out points; no nested clips were changed.");
+  const sources = new Map();
+  for (const entry of prepared) {
+    const path = fillSourceFor(entry.action);
+    if (sources.has(path)) continue;
+    const source = await ensureSourceClip(project, path);
+    const savedIn = await source.clipItem.getInPoint(mediaType);
+    const savedOut = await source.clipItem.getOutPoint(mediaType);
+    if (!savedIn || savedIn.ticks == null || !savedOut || savedOut.ticks == null) {
+      throw new Error("Could not read source in/out points; no nested clips were changed.");
+    }
+    sources.set(path, { source, savedIn, savedOut, touched: false });
   }
   let filled = 0;
-  let marksTouched = false;
   let failure = null;
   try {
     for (const entry of prepared) {
       const { action, dest, start, end } = entry;
+      const state = sources.get(fillSourceFor(action));
+      const source = state.source;
       const inT = await makeTick(start);
       const outT = await makeTick(end);
       const editor = ppro.SequenceEditor.getEditor(dest);
       const zero = await makeTick(0);
       const audioBefore = await snapshotAudio(dest);
       // Commit the range first: overwrite must see this range, not the previous cut.
-      marksTouched = true;
+      state.touched = true;
       const range = runNamedAction(project, "Set source range " + action.slot_id, () =>
         source.clipItem.createSetInOutPointsAction(inT, outT)
       );
@@ -540,7 +657,8 @@ async function applyNestedPlan() {
   } catch (err) {
     failure = err;
   } finally {
-    if (marksTouched) {
+    for (const { source, savedIn, savedOut, touched } of sources.values()) {
+      if (!touched) continue;
       const restored = runNamedAction(project, "Restore source in/out points", () =>
         source.clipItem.createSetInOutPointsAction(savedIn, savedOut)
       );

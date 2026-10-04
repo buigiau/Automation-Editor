@@ -8,14 +8,18 @@ import pytest
 from autoedit.cubase import host
 
 
-def test_import_reads_manual_selection_before_any_project_or_selection_action(tmp_path, monkeypatch):
+@pytest.mark.parametrize("expected_indices,selected_indices,name_pattern", [
+    ((1, 2), (1,), "Sampler Track {i:02d}"),
+    (tuple(range(2, 14)), tuple(range(1, 13)), "SAMPLER TRACK {i}"),
+])
+def test_import_reads_manual_selection_before_any_project_or_selection_action(tmp_path, monkeypatch, expected_indices, selected_indices, name_pattern):
     plan = {"project": {"cubase_project": "locked.cpr"}, "cubase_slots": [
-        {"cubase": {"track_name": f"Sampler Track {i:02d}"}} for i in (1, 2)]}
+        {"cubase": {"track_name": name_pattern.format(i=i)}} for i in expected_indices]}
     path = tmp_path / "edit-plan.json"
     path.write_text(json.dumps(plan))
-    root = ET.fromstring('''<root><list name="track"><obj class="MSamplerTrackEvent">
-        <obj name="Node"><string name="Name" value="Sampler Track 01"/></obj>
-        </obj></list></root>''')
+    tracks = ''.join(f'<obj class="MSamplerTrackEvent"><obj name="Node"><string name="Name" '
+                     f'value="{name_pattern.format(i=i)}"/></obj></obj>' for i in selected_indices)
+    root = ET.fromstring(f'<root><list name="track">{tracks}</list></root>')
     calls = []
     class Window:
         def is_visible(self): return True
@@ -37,17 +41,19 @@ def test_import_reads_manual_selection_before_any_project_or_selection_action(tm
     assert json.loads(path.read_text()) == plan
 
 
-def test_import_updates_open_project_without_saving_and_cleans_success_artifacts(tmp_path, monkeypatch):
+@pytest.mark.parametrize("track_indices,name_pattern", [((1, 2), "Sampler Track {i:02d}"),
+                                                        (tuple(range(2, 14)), "SAMPLER TRACK {i}")])
+def test_import_updates_open_project_without_saving_and_cleans_success_artifacts(tmp_path, monkeypatch, track_indices, name_pattern):
     track_xml = ''.join(
-        f'<obj class="MSamplerTrackEvent"><obj name="Node"><string name="Name" value="Sampler Track {i:02d}"/></obj></obj>'
-        for i in (1, 2)
+        f'<obj class="MSamplerTrackEvent"><obj name="Node"><string name="Name" value="{name_pattern.format(i=i)}"/></obj></obj>'
+        for i in track_indices
     )
     root = ET.fromstring(f'<root><list name="track">{track_xml}</list></root>')
     project = tmp_path / "paired.cpr"
     plan = {
         "project": {"cubase_project": str(project)},
-        "cubase_slots": [{"cubase": {"track_name": f"Sampler Track {i:02d}", "sample_path": f"sample{i}.wav"}}
-                         for i in (1, 2)],
+        "cubase_slots": [{"cubase": {"track_name": name_pattern.format(i=i), "sample_path": f"sample{i}.wav"}}
+                         for i in track_indices],
     }
     plan_path = tmp_path / "edit-plan.json"
     plan_path.write_text(json.dumps(plan))

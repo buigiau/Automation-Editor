@@ -37,12 +37,15 @@ DEFAULTS: dict[str, Any] = {
         "speech_compute_type": "auto",
         "speech_device_index": 0,
         "speech_language": "en",
+        "require_lip_motion": False,
+        "object_detection": {"enabled": "auto", "device": "auto", "threshold": .3},
         "characters": dict(CHARACTER_DEFAULTS),
     },
     "cubase": {
         "project": "",
         "track_name_pattern": "Sampler Track {index:02d}",
         "sampler_track_count": 16,
+        "sampler_tracks": "",
         "sample_rate": 48000,
         "channels": 2,
     },
@@ -78,7 +81,7 @@ def apply_inputs(
     *,
     premiere: str | Path | None = None,
     cubase: str | Path | None = None,
-    video: str | Path | None = None,
+    video: str | Path | list[str | Path] | None = None,
     audio_dir: str | Path | None = None,
     output_dir: str | Path | None = None,
 ) -> dict[str, Any]:
@@ -88,9 +91,25 @@ def apply_inputs(
     if cubase:
         cfg.setdefault("cubase", {})["project"] = str(Path(cubase))
     if video:
-        cfg.setdefault("premiere", {})["source_media"] = str(Path(video))
+        paths = source_paths(video)
+        cfg.setdefault("premiere", {})["source_media"] = paths[0] if len(paths) == 1 else paths
     if audio_dir:
         cfg.setdefault("audio", {})["directory"] = str(Path(audio_dir))
     if output_dir:
         cfg.setdefault("job", {})["output_dir"] = str(Path(output_dir))
     return cfg
+
+
+def source_paths(value) -> list[str]:
+    """Accept the legacy path or a list; keep each physical file only once."""
+    values = value if isinstance(value, (list, tuple)) else [value]
+    paths, seen = [], set()
+    for item in values:
+        if not item or not str(item).strip():
+            continue
+        path = Path(str(item).strip())
+        key = str(path.resolve()).casefold()
+        if key not in seen:
+            paths.append(str(path))
+            seen.add(key)
+    return paths

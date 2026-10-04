@@ -1,6 +1,7 @@
 """Decode once, select by timestamps, resize only selected frames."""
 
-def sampled_frames(path, sample_fps, max_seconds=0, width=640, transition_detector=None):
+def sampled_frames(path, sample_fps, max_seconds=0, width=640, transition_detector=None,
+                   between_samples=None):
     import av
 
     with av.open(str(path)) as container:
@@ -18,6 +19,8 @@ def sampled_frames(path, sample_fps, max_seconds=0, width=640, transition_detect
                 thumbnail = frame.reformat(width=160, height=90, format="bgr24")
                 transition_detector.observe(time, thumbnail.to_ndarray(format="bgr24"))
             if time + 1e-6 < next_time:
+                if between_samples is not None:
+                    between_samples(time, frame)
                 continue
             if frame.width > width:
                 frame = frame.reformat(width=width, height=max(2, round(frame.height * width / frame.width)), format="bgr24")

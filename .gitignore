@@ -1,4 +1,6 @@
 .venv/
+.venv-gpu/
+.venv-objects/
 __pycache__/
 *.pyc
 output/
@@ -11,3 +13,4 @@ models/*.task
 models/*.download
 models/whisper/
 models/characters/
+models/objects/

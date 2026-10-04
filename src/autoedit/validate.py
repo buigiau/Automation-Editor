@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Any
 
 from autoedit.audio.analyzer import iter_audio_files
+from autoedit.config import source_paths
 from autoedit.premiere.prproj import inspect_prproj
+from autoedit.cubase.inspect import inspect_sampler_tracks, parse_sampler_tracks, select_sampler_tracks
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".wmv", ".mpg", ".mpeg", ".mxf"}
 TEMPLATE_SEQUENCE = "PJ 5 - demo"
@@ -37,14 +39,20 @@ def validate_inputs(
     *,
     premiere_project: str | Path = "",
     cubase_project: str | Path = "",
-    source_video: str | Path = "",
+    source_video: str | Path | list[str | Path] = "",
     audio_directory: str | Path = "",
     template_sequence: str = TEMPLATE_SEQUENCE,
+    video_track_index: int = 1,
+    sampler_tracks=None,
 ) -> list[str]:
     errors: list[str] = []
     errors += _exist_file(premiere_project, "Premiere project", {".prproj"})
     errors += _exist_file(cubase_project, "Cubase project", {".cpr"})
-    errors += _exist_file(source_video, "Source video", VIDEO_SUFFIXES)
+    videos = source_paths(source_video)
+    if not videos:
+        errors.append("Source video is not selected")
+    for path in videos:
+        errors += _exist_file(path, "Source video", VIDEO_SUFFIXES)
 
     if not audio_directory:
         errors.append("Audio folder is not selected")
@@ -59,18 +67,20 @@ def validate_inputs(
             if not wavs:
                 errors.append(f"Audio folder has no WAV files: {audio}")
 
+    info = None
     if premiere_project and Path(premiere_project).is_file() and Path(premiere_project).suffix.lower() == ".prproj":
         try:
             info = inspect_prproj(
                 premiere_project,
                 source_sequence="",
                 template_sequence=template_sequence,
+                video_track_index=video_track_index,
             )
         except Exception as exc:
             errors.append(f"Premiere project could not be read: {exc}")
         else:
             names = {s.get("name") for s in (info.get("sequences") or [])}
-            if template_sequence not in names:
+            if not info.get("template_sequence"):
                 errors.append(
                     f"Premiere project has no sequence named {template_sequence!r}. "
                     f"Found: {sorted(n for n in names if n)}"
@@ -79,6 +89,13 @@ def validate_inputs(
                 errors.append(
                     f"Sequence {template_sequence!r} has no video slots on the template track"
                 )
+    try:
+        indices = parse_sampler_tracks(sampler_tracks)
+        if (indices is not None and info is not None and cubase_project
+                and Path(cubase_project).is_file() and Path(cubase_project).suffix.lower() == ".cpr"):
+            select_sampler_tracks(inspect_sampler_tracks(cubase_project), indices, len(info["scene_slots"]))
+    except ValueError as exc:
+        errors.append(f"Cubase sampler selection: {exc}")
     return errors
 
 

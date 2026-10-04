@@ -38,6 +38,26 @@ def test_gradual_dissolve_is_detected_without_large_adjacent_changes():
     assert not transition_metrics(sorted(set(detector.events)), 0, 3)['transition_safe']
 
 
+def test_hard_cut_does_not_generate_transitions_in_the_following_shot():
+    detector = TransitionDetector()
+    for i in range(48):
+        detector.observe(i/24,np.full((90,160,3),30 if i < 24 else 180,np.uint8))
+    assert detector.events == [1.]
+    assert transition_metrics(detector.events,1.2,1.8)['transition_safe']
+
+
+def test_textured_camera_pan_is_not_a_transition():
+    import cv2
+    texture = np.random.default_rng(41).integers(20,230,(90,160,3),dtype=np.uint8)
+    texture = cv2.GaussianBlur(texture,(5,5),0)
+    detector = TransitionDetector()
+    for i in range(16):
+        frame = cv2.warpAffine(texture,np.float32([[1,0,i],[0,1,0]]),(160,90),
+                               borderMode=cv2.BORDER_REFLECT)
+        detector.observe(i/30,frame)
+    assert not detector.events
+
+
 def test_matcher_prefers_uncut_body_shot_over_closeup_with_late_cut():
     samples = [sample(i / 10, 1 if i < 60 else 3) for i in range(120)]
     result = match_slots_to_video([{'id': '1', 'required_duration_sec': 5}], [],

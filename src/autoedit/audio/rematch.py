@@ -3,6 +3,7 @@ import copy
 from collections import Counter
 
 from autoedit.audio.scene_match import choose_audio
+from autoedit.video.pool import shift_times
 
 
 def rematch_fixed_slots(plan, candidates, video_info):
@@ -16,7 +17,16 @@ def rematch_fixed_slots(plan, candidates, video_info):
     for slot in result["cubase_slots"]:
         uid = slot["premiere"]["nested_sequence_uid"]
         if uid not in selected:
-            selected[uid] = choose_audio(candidates, slot["video"], video_info, used, recent=recent)
+            cut = slot["video"]
+            offset = 0.0
+            if video_info.get("source_spans"):
+                span = next((s for s in video_info["source_spans"] if s["path"] == cut.get("source_video")), None)
+                if span is None:
+                    raise ValueError("Saved cut source is missing from the source pool; run the full pipeline again.")
+                offset = span["offset_sec"]
+                cut = shift_times(cut, offset)
+            audio, evidence = choose_audio(candidates, cut, video_info, used, recent=recent)
+            selected[uid] = audio, shift_times(evidence, -offset)
             used[selected[uid][0]["path"]] += 1
         audio, evidence = selected[uid]
         slot["audio"], slot["audio_match"] = copy.deepcopy(audio), copy.deepcopy(evidence)

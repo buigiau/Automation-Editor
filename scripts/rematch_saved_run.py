@@ -18,12 +18,15 @@ def rebuild(source_dir, output_dir):
     def read(name):
         return json.loads((src / name).read_text(encoding="utf-8"))
     plan, speech, video = read("edit-plan.json"), read("source_transcript.json"), read("video_analysis.json")
-    source = Path(plan["project"]["source_video"])
-    identity = speech["cache_identity"]
-    stat = source.stat()
-    if (Path(identity["path"]).resolve() != source.resolve() or identity["size"] != stat.st_size
-            or identity["mtime_ns"] != stat.st_mtime_ns):
-        raise ValueError("Source video changed; run the full pipeline again.")
+    sources = plan["project"].get("source_videos") or [{"path": plan["project"]["source_video"]}]
+    for entry in sources:
+        source = Path(entry["path"])
+        source_speech = speech.get("sources", {}).get(entry["path"], speech)
+        identity = source_speech["cache_identity"]
+        stat = source.stat()
+        if (Path(identity["path"]).resolve() != source.resolve() or identity["size"] != stat.st_size
+                or identity["mtime_ns"] != stat.st_mtime_ns):
+            raise ValueError("Source video changed; run the full pipeline again.")
     out.mkdir(parents=True, exist_ok=True)
     # Refresh actual WAV analysis, so edits to the voice library are measured.
     audio = [analyze_file(path) for path in dict.fromkeys(item["path"] for item in read("audio_analysis.json"))]

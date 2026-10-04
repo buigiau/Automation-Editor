@@ -82,17 +82,20 @@ def test_old_destructive_plans_rejected():
                                   "premiere": {"mode": "timeline_clip"}}]})
 
 
-@pytest.mark.parametrize('intro_state', [None, 'occupied'])
+@pytest.mark.parametrize('intro_state', [None, 'occupied', 'empty'])
 def test_pipeline_audio_count_never_changes_video_slot_count(tmp_path, monkeypatch, intro_state):
     import autoedit.pipeline as pipeline
 
     inspected = inspect_prproj(fixture_project(tmp_path))
-    inspected['intro_slot'] = ({'status': 'occupied', 'start_sec': 0, 'end_sec': 1,
+    inspected['intro_slot'] = ({'id': 'intro', 'status': intro_state, 'start_sec': 0, 'end_sec': 1,
+                               'required_duration_sec': 1, 'video_track_index': 1,
                                'reason': 'Existing opening content'} if intro_state else None)
     monkeypatch.setattr(pipeline, 'inspect_prproj', lambda *a, **kw: inspected)
     selections = []
+    selection_arguments = []
     def select(targets, *args, **kwargs):
         selections.append(targets)
+        selection_arguments.append(kwargs)
         return match_slots_to_video(targets, *args, **kwargs)
     monkeypatch.setattr(pipeline, 'match_slots_to_video', select)
     audio = [{"id": str(i), "path": f"{i}.wav", "duration_sec": 0.1, "category": "HI", "group": "NEUTRAL"} for i in range(100)]
@@ -112,7 +115,7 @@ def test_pipeline_audio_count_never_changes_video_slot_count(tmp_path, monkeypat
     monkeypatch.setattr(pipeline, "apply_cubase_plan", lambda plan, out: received.append(plan) or {})
     result = pipeline.run_pipeline({
         "job": {"output_dir": str(tmp_path / "output")},
-        "video": {"characters": {"enabled": False}},
+        "video": {"require_lip_motion": False, "characters": {"enabled": False}},
         "cubase": {"project": "test.cpr"},
         "premiere": {"project": str(fixture_project(tmp_path)), "source_media": "source.mp4",
                      "slot_mode": "timeline_clips"},
@@ -121,10 +124,61 @@ def test_pipeline_audio_count_never_changes_video_slot_count(tmp_path, monkeypat
     assert len(received[0]["cubase_slots"]) == 1
     assert len(result["plan"]["audio"]) == 1
     assert len(received[0]["cubase_slots"][0]["premiere"]["instances"]) == 2
-    assert len(selections) == 1  # No extra source range reserved for an intro.
-    assert not result['plan'].get('intro_fill')
-    assert not apply_payload(result['plan']).get('intro_fill')
-    assert 'no intro will be added' in (tmp_path / 'output/run.log').read_text(encoding='utf-8')
+    if intro_state == 'empty':
+        assert len(selections) == 2
+        assert selections[1][0]['id'] == 'intro'
+        assert selection_arguments[1]['require_speaking'] is False
+        fill = result['plan']['intro_fill']
+        main = result['plan']['slots'][0]['video']
+        assert selection_arguments[1]['excluded_ranges'] == [(main['in_sec'],main['out_sec'])]
+        assert max(main['in_sec']-fill['out_sec'], fill['in_sec']-main['out_sec']) >= 5
+        assert apply_payload(result['plan'])['intro_fill']
+    else:
+        assert len(selections) == 1  # No extra source range reserved for an intro.
+        assert not result['plan'].get('intro_fill')
+        assert not apply_payload(result['plan']).get('intro_fill')
+        assert 'no intro will be added' in (tmp_path / 'output/run.log').read_text(encoding='utf-8')
+
+
+def test_pipeline_reselects_static_dense_cut_before_assigning_any_voice(tmp_path, monkeypatch):
+    import autoedit.pipeline as pipeline
+    from test_characters import face
+    inspected = inspect_prproj(fixture_project(tmp_path))
+    monkeypatch.setattr(pipeline, 'inspect_prproj', lambda *a, **kw: inspected)
+    monkeypatch.setattr(pipeline, 'require_inputs', lambda **kw: None)
+    monkeypatch.setattr(pipeline, 'inspect_sampler_tracks', lambda path: {
+        'path':path, 'tracks':[{'index':1,'name':'Sampler Track 01'}]})
+    monkeypatch.setattr(pipeline, 'analyze_audio_dir', lambda *a, **kw: [
+        {'id':'hi','path':'hi.wav','name':'hi.wav','duration_sec':1,'category':'HI',
+         'group':'NEUTRAL','phonetics':{'action':'SPEECH','visemes':['A','E']}}])
+    monkeypatch.setattr(pipeline, 'expand_match_units', lambda items: [])
+    monkeypatch.setattr(pipeline, 'analyze_video', lambda *a, **kw: {
+        'path':'source.mp4','duration_sec':30,'sample_fps':6,
+        'samples':[{**face(),'time_sec':i/6,'face_visible':1,'clear_face':1,'speaking':1,
+                    'lip_aperture':.05 if i%2 else .3,'lip_width_ratio':.5} for i in range(180)]})
+    monkeypatch.setattr(pipeline, 'transcribe_source', lambda *a, **kw: {'has_audio':False,'words':[]})
+    monkeypatch.setattr(pipeline, 'prepare_video_only_source', lambda *a, **kw: 'video-only.mov')
+    monkeypatch.setattr(pipeline, 'write_audio_review', lambda *a, **kw: None)
+    monkeypatch.setattr(pipeline, 'apply_cubase_plan', lambda *a, **kw: {})
+    refined = []
+    def refine(path, slots, *args, **kwargs):
+        cuts = [s['video'] for s in slots]
+        refined.append(cuts)
+        return {'samples':[
+            {**face(), 'time_sec':cut['in_sec']+i/20, 'clear_face':1,'speaking':1,
+             'lip_width_ratio':.5, 'lip_aperture':(.05 if i%2 else .3) if len(refined)>1 else .2}
+            for cut in cuts for i in range(round((cut['out_sec']-cut['in_sec'])*20))]}
+    monkeypatch.setattr(pipeline, 'refine_selected_cuts', refine)
+    result = pipeline.run_pipeline({'job':{'output_dir':str(tmp_path/'output')},
+        'premiere':{'project':'template.prproj','source_media':'source.mp4'},
+        'cubase':{'project':'template.cpr'},
+        'video':{'source_gap_sec':0,'require_lip_motion':True,'characters':{'enabled':False}}})
+    assert len(refined) == 2
+    old, final = refined[0][0], result['plan']['slots'][0]['video']
+    assert final['out_sec'] <= old['in_sec'] or final['in_sec'] >= old['out_sec']
+    assert final['used_duration_sec'] == old['used_duration_sec'] == 4
+    assert final['selection_metrics']['dense_lip_motion_verified']
+    assert result['plan']['cubase_slots'][0]['audio_match']['method'] == 'filename-visemes-and-dense-lip-rhythm'
 
 
 @pytest.mark.parametrize("has_main_cut", [False, True])

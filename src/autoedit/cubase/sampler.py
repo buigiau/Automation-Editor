@@ -129,7 +129,8 @@ def render_sampler_bundle(plan, output_dir):
     plan["audio_preview"] = {"path": str(preview.resolve()), "duration_sec": total,
                              "render_kind": "premiere-repeat-preview", "includes_cubase_midi_fx": False}
     instructions = [
-        "Open the paired Cubase template in Cubase 13. Manually select all numbered Sampler Tracks before clicking Import Cubase.",
+        "Open the paired Cubase template in Cubase 13. Manually select exactly these Sampler Tracks before clicking Import Cubase: "
+        + ", ".join(s["cubase"]["track_name"] for s in slots) + ".",
         "Click Import Cubase in AutoEdit, or run: autoedit cubase-import edit-plan.json. Windows display scaling must be 100% for this tested Cubase 13 import profile.",
         "The importer loads samples into the open Cubase project and verifies unchanged MIDI, sampler parameters and effects without saving; review and save manually if desired.",
         "Sampler WAVs start at the voice onset. Source-word offsets apply only to the Premiere preview; Cubase uses existing MIDI triggers.",

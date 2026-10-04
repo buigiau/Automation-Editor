@@ -47,6 +47,17 @@ def test_gap_is_never_silently_reduced_and_unanalyzed_footage_is_excluded():
     assert all(m["video"]["out_sec"] <= 20 for m in result)
 
 
+def test_rejected_candidate_does_not_consume_a_source_gap_as_if_selected():
+    video={'duration_sec':10,'sample_fps':2,
+           'samples':[{'time_sec':i/2,'face_visible':1} for i in range(20)]}
+    cuts=match_slots_to_video(slots(2,2),[],video,min_gap_sec=3,rejected_ranges=[(0,1)])
+    ranges=sorted((cut['video']['in_sec'],cut['video']['out_sec']) for cut in cuts)
+    assert all(start >= 1 for start,end in ranges)
+    assert ranges[1][0]-ranges[0][1] >= 3-1e-8
+    with pytest.raises(ValueError,match='Not enough'):
+        match_slots_to_video(slots(2,2),[],video,min_gap_sec=3,excluded_ranges=[(0,1)])
+
+
 def test_long_windows_are_reserved_before_short_slots_without_reordering_audio():
     from test_shot_tiers import sample
     video = {'duration_sec': 12, 'samples': [
@@ -150,7 +161,8 @@ def test_animation_pipeline_prioritizes_source_word_then_neutral(tmp_path, monke
     result = pipeline.run_pipeline({"job": {"output_dir": str(tmp_path / "out")},
         "cubase": {"project": "test.cpr"},
         "premiere": {"project": str(fixture_project(tmp_path)), "source_media": "source.mp4"},
-        "video": {"source_kind": "animation", "characters": {"enabled": False}}})
+        "video": {"source_kind": "animation", "require_lip_motion": False,
+                  "characters": {"enabled": False}}})
     plan = result["plan"]
     assert len(plan["slots"]) == 1
     assert len(plan["cubase_slots"]) == 1

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import math
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -265,6 +266,8 @@ def nested_sequence_slots(
                 "duration_sec": item.get("duration_sec"),
                 "source_in_sec": item.get("source_in_sec"),
                 "source_out_sec": item.get("source_out_sec"),
+                **({"template_video_track_index": item["template_video_track_index"]}
+                   if "template_video_track_index" in item else {}),
             }
         )
     slots = [groups[n] for n in order]
@@ -273,6 +276,87 @@ def nested_sequence_slots(
         slot["id"] = f"slot-{i+1:02d}"
         slot["mode"] = "nested_sequence"
     return slots
+
+
+def _nested_items(sequence: dict[str, Any]) -> list[dict[str, Any]]:
+    return [item for track in sequence["video_tracks"] for item in track["items"]
+            if item.get("nested_sequence_uid")
+            and not str(item.get("nested_sequence") or "").lower().startswith("adjustment")]
+
+
+def _recursive_layout(template, by_uid, video_track_index):
+    """Resolve footage leaves, keeping local references and root timeline timing.
+
+    The configured root track defines audio scenes. Other root tracks contribute
+    footage fills/markers; overlapping overlays do not invent sampler tracks.
+    """
+    structure, visited, incoming = [], set(), defaultdict(list)
+
+    def collect(sequence, ancestors):
+        uid = sequence["uid"]
+        if uid in ancestors:
+            raise ValueError(f"Cyclic nested sequence: {sequence['name']}")
+        if uid in visited:
+            return
+        visited.add(uid)
+        if not _nested_items(sequence):
+            return
+        for track in sequence["video_tracks"]:
+            refs = [dict(item) for item in track["items"] if item.get("nested_sequence_uid")]
+            structure.append({"sequence_uid": uid, "sequence_name": sequence["name"],
+                              "video_track_index": track["index"], "instances": refs})
+            for item in refs:
+                child = by_uid[item["nested_sequence_uid"]]
+                incoming[child["uid"]].append(item)
+                collect(child, ancestors + [uid])
+
+    collect(template, [])
+
+    def flatten(sequence, lo, hi, offset, root_track=None):
+        items = []
+        for track in sequence["video_tracks"]:
+            for item in track["items"]:
+                uid = item.get("nested_sequence_uid")
+                if not uid:
+                    continue
+                start, end = max(lo, item["start_sec"]), min(hi, item["end_sec"])
+                if end <= start + 1e-9:
+                    continue
+                source_in = float(item.get("source_in_sec") or 0)
+                source_out = item.get("source_out_sec")
+                duration = item["end_sec"] - item["start_sec"]
+                if source_out is None:
+                    source_out = source_in + duration
+                if (not all(math.isfinite(v) for v in (source_in, source_out, duration))
+                        or source_in < 0 or duration <= 0
+                        or abs(source_out - source_in - duration) > 1e-6):
+                    raise ValueError(f"Retimed nested clip in {sequence['name']} requires an explicit timing map")
+                child = by_uid[uid]
+                index = track["index"] if root_track is None else root_track
+                child_lo = source_in + start - item["start_sec"]
+                child_hi = source_in + end - item["start_sec"]
+                if _nested_items(child):
+                    items.extend(flatten(child, child_lo, child_hi,
+                                         offset + item["start_sec"] - source_in, index))
+                else:
+                    items.append({**item, "start_sec": offset + start, "end_sec": offset + end,
+                                  "duration_sec": end - start, "source_in_sec": child_lo,
+                                  "source_out_sec": child_hi, "template_video_track_index": index})
+        return items
+
+    end = max((i["end_sec"] or 0 for t in template["video_tracks"] for i in t["items"]), default=0)
+    items = flatten(template, 0, end, 0)
+    tracks = [{"index": video_track_index, "items": items}]
+    slots = nested_sequence_slots(tracks, video_track_index)
+    for slot in slots:
+        refs = incoming[slot["nested_sequence_uid"]]
+        slot["required_duration_sec"] = max(slot["required_duration_sec"],
+                                            max((i.get("source_out_sec") or
+                                                 (i.get("source_in_sec") or 0) + i["duration_sec"]
+                                                 for i in refs), default=0))
+    primary = [i for i in items if i["template_video_track_index"] == video_track_index]
+    scenes = scene_run_slots([{"index": video_track_index, "items": primary}], video_track_index)
+    return slots, scenes, structure
 
 
 def timeline_instance_slots(
@@ -344,10 +428,30 @@ def inspect_prproj(
         sequences.append(info)
         by_name[name] = info
 
-    template = by_name.get(template_sequence)
+    matches = [s for s in sequences if s["name"] == template_sequence]
+    if len(matches) > 1:
+        raise ValueError(f"Template sequence name is ambiguous: {template_sequence}")
+    template = matches[0] if matches else None
+    template_selection = "configured"
+    if template is None and template_sequence == "PJ 5 - demo":
+        referenced = {i["nested_sequence_uid"] for s in sequences for i in _nested_items(s)}
+        candidates = [s for s in sequences if s["uid"] not in referenced
+                      and any(t["index"] == video_track_index
+                              and any(i.get("nested_sequence_uid") for i in t["items"])
+                              for t in s["video_tracks"])]
+        if len(candidates) > 1:
+            raise ValueError("Multiple template sequences found; configure premiere.template_sequence: "
+                             + ", ".join(s["name"] for s in candidates))
+        if candidates:
+            template = candidates[0]
+            template_selection = "unique_root"
     source = by_name.get(source_sequence) if source_sequence else None
     nested = nested_sequence_slots(template["video_tracks"], video_track_index) if template else []
     by_uid = {s["uid"]: s for s in sequences}
+    structure = None
+    scenes = scene_run_slots(template["video_tracks"], video_track_index) if template else []
+    if template and nested and any(_nested_items(by_uid[i["nested_sequence_uid"]]) for i in _nested_items(template)):
+        nested, scenes, structure = _recursive_layout(template, by_uid, video_track_index)
     for slot in nested:
         child = by_uid[slot["nested_sequence_uid"]]
         # Keep adjustment layers on their existing tracks. The footage lives on V1.
@@ -370,11 +474,13 @@ def inspect_prproj(
             for s in sequences
         ],
         "source_sequence": source_sequence if source else None,
-        "template_sequence": template_sequence if template else None,
+        "template_sequence": template["name"] if template else None,
+        "template_selection": template_selection if template else None,
+        "nested_structure": structure,
         "media_paths": _media_paths(idx),
         "slots": nested,
         "instance_slots": instances,
-        "scene_slots": scene_run_slots(template["video_tracks"], video_track_index) if template else [],
+        "scene_slots": scenes,
         "intro_slot": intro_slot(template["video_tracks"], nested, video_track_index) if template else None,
         "template_video_tracks": template["video_tracks"] if template else [],
         "template_audio_tracks": template["audio_tracks"] if template else [],

@@ -99,6 +99,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         cfg.setdefault("video", {})["source_kind"] = args.source_kind
     if args.source_gap is not None:
         cfg.setdefault("video", {})["source_gap_sec"] = args.source_gap
+    if args.main_group:
+        cfg.setdefault("video", {}).setdefault("characters", {})["main_group"] = args.main_group
+        if args.main_group != "auto":
+            cfg["video"]["characters"]["enabled"] = True
+    if args.sampler_tracks is not None:
+        cfg.setdefault("cubase", {})["sampler_tracks"] = args.sampler_tracks
     apply_inputs(
         cfg,
         premiere=args.premiere,
@@ -116,6 +122,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         source_video=prem.get("source_media") or "",
         audio_directory=audio.get("directory") or "",
         template_sequence=prem.get("template_sequence") or "PJ 5 - demo",
+        video_track_index=int(prem.get("video_track_index", 1)),
+        sampler_tracks=cubase.get("sampler_tracks"),
     )
     result = run_pipeline(cfg, log=_print)
     plan = result["plan"]
@@ -184,10 +192,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-c", "--config")
     s.add_argument("--premiere", help="Premiere .prproj")
     s.add_argument("--cubase", help="Cubase .cpr")
-    s.add_argument("--video", help="Source video file to analyze")
+    s.add_argument("--video", action="append", help="Source video file; repeat for multiple videos")
     s.add_argument("--audio-dir", help="Folder of short voice WAV files")
     s.add_argument("--source-kind", choices=["live_action", "animation"], help="Animation uses neutral voices when no source word matches")
     s.add_argument("--source-gap", type=float, help="Minimum seconds between selected source ranges (default 5)")
+    s.add_argument("--main-group", choices=["auto", "yellow_minions"], help=argparse.SUPPRESS)
+    s.add_argument("--sampler-tracks", help="Sampler numbers to fill, e.g. 2-13 or 1,3-5; omitted keeps configured mapping")
     s.add_argument("-o", "--output-dir")
     s.set_defaults(func=cmd_run)
 

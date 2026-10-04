@@ -1,6 +1,7 @@
 """Local listening sheet: source soundtrack beside each selected voice."""
 from html import escape
 from pathlib import Path
+from contextlib import ExitStack
 
 
 def write_audio_review(plan, output_dir, speech):
@@ -13,25 +14,33 @@ def write_audio_review(plan, output_dir, speech):
     clips.mkdir(parents=True, exist_ok=True)
     source = plan["project"]["source_video"]
     originals = {}
-    with av.open(source) as container:
-        if container.streams.audio:
+    with ExitStack() as stack:
+        containers = {}
+        for slot in plan["cubase_slots"]:
+            uid = slot["premiere"]["nested_sequence_uid"]
+            if uid in originals:
+                continue
+            cut = slot["video"]
+            path_source = cut.get("source_video") or slot.get("source_video") or source
+            if path_source not in containers:
+                containers[path_source] = stack.enter_context(av.open(path_source))
+            container = containers[path_source]
+            if not container.streams.audio:
+                continue
             stream = container.streams.audio[0]
             video = container.streams.video[0] if container.streams.video else stream
             origin = float(video.start_time * video.time_base) if video.start_time is not None else 0
-            for slot in plan["cubase_slots"]:
-                uid = slot["premiere"]["nested_sequence_uid"]
-                if uid in originals:
-                    continue
-                cut = slot["video"]
-                path = clips / f"scene_{len(originals)+1:02d}.wav"
-                pcm = _decode_window(container, stream, origin, cut["in_sec"], cut["out_sec"])
-                sf.write(path, pcm, 16000, subtype="PCM_16")
-                originals[uid] = path.relative_to(out).as_posix()
+            path = clips / f"scene_{len(originals)+1:02d}.wav"
+            pcm = _decode_window(container, stream, origin, cut["in_sec"], cut["out_sec"])
+            sf.write(path, pcm, 16000, subtype="PCM_16")
+            originals[uid] = path.relative_to(out).as_posix()
     rows = []
     for slot in plan["cubase_slots"]:
         prem, audio, video, match, cubase = (slot[k] for k in ("premiere", "audio", "video", "audio_match", "cubase"))
         uid = prem["nested_sequence_uid"]
-        words = " ".join(w["word"] for w in speech.get("words", [])
+        path_source = video.get("source_video") or slot.get("source_video") or source
+        source_speech = speech.get("sources", {}).get(path_source, speech)
+        words = " ".join(w["word"] for w in source_speech.get("words", [])
                          if w["start"] < video["out_sec"] and w["end"] > video["in_sec"])
         matched = match.get("source_word") or match.get("source_action")
         method = f'Từ nguồn: {matched}' if matched else 'Ước lượng theo hình miệng / âm dự phòng'

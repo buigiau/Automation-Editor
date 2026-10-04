@@ -20,8 +20,8 @@ class FaceLandmarker:
             raise FileNotFoundError(f"Face landmark model missing: {path}. Run scripts/setup_face_model.py first.")
         self.task = Task.create_from_options(FaceLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=str(path)), running_mode=RunningMode.VIDEO,
-            num_faces=8, min_face_detection_confidence=0.6, min_face_presence_confidence=0.6,
-            min_tracking_confidence=0.6))
+            num_faces=8, min_face_detection_confidence=0.5, min_face_presence_confidence=0.5,
+            min_tracking_confidence=0.5))
 
     def close(self):
         self.task.close()
@@ -74,18 +74,38 @@ class FaceLandmarker:
 
 
 def _same_face(a, b):
-    ax, ay, aw, ah = a["face"]
-    bx, by, bw, bh = b["face"]
+    use_subject_boxes = a.get('track_box') is not None and b.get('track_box') is not None
+    ax, ay, aw, ah = a['track_box'] if use_subject_boxes else a["face"]
+    bx, by, bw, bh = b['track_box'] if use_subject_boxes else b["face"]
     overlap = max(0, min(ax + aw, bx + bw) - max(ax, bx)) * max(0, min(ay + ah, by + bh) - max(ay, by))
-    return overlap / max(1, aw * ah + bw * bh - overlap) >= 0.45
+    iou = overlap / max(1, aw * ah + bw * bh - overlap)
+    if (use_subject_boxes and a.get('track_id') and a.get('track_id') == b.get('track_id')
+            and b.get('track_association') == 'unambiguous-nested-head-body'
+            and a['track_box'] == b.get('track_previous_box')):
+        from autoedit.video.objects import object_evidence, subject_family
+        if object_evidence(a) and object_evidence(b) and subject_family(a) == subject_family(b) and subject_family(a):
+            return True
+    # An established physical track can move between samples. Identity alone
+    # cannot connect different tracks, including co-visible copies of a creature.
+    confirmed_track = (a.get("track_id") and a.get("track_id") == b.get("track_id")
+                       and a.get("character_id") and a.get("character_id") == b.get("character_id")
+                       and min(a.get("identity_confidence", 0), b.get("identity_confidence", 0)) >= .5)
+    return iou >= (.25 if confirmed_track else .45)
 
 
 class MultiRegionFaceLandmarker:
     """Track faces in overlapping views so small/grouped faces are not missed."""
 
-    def __init__(self):
+    def __init__(self, main_group="auto", include_animation=True):
         self.detectors = []
         self.previous = None
+        self.main_group = main_group
+        self.include_animation = include_animation
+        self.minion_gray = None
+        self.minion_faces = []
+        self.minion_time = None
+        if main_group == "yellow_minions":
+            return
         try:
             for _ in range(4):
                 self.detectors.append(FaceLandmarker())
@@ -115,12 +135,32 @@ class MultiRegionFaceLandmarker:
     def detect_all(self, frame, time_sec):
         import cv2
         from autoedit.video.analyzer import _visual_quality
+        from autoedit.video.animation import cartoon_faces, minion_faces, tracked_goggles
 
         h, w = frame.shape[:2]
         regions = [(0, 0, w, h),
                    (0, int(.15 * h), int(.6 * w), int(.85 * h)),
                    (int(.2 * w), int(.15 * h), int(.8 * w), int(.85 * h)),
                    (int(.4 * w), int(.15 * h), w, int(.85 * h))]
+        if self.main_group == "yellow_minions":
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            hints = (tracked_goggles(self.minion_gray, gray, self.minion_faces)
+                     if self.minion_time is not None and 0 < time_sec-self.minion_time <= .6 else [])
+            found = minion_faces(frame, hints)
+            self.minion_gray, self.minion_faces, self.minion_time = gray, found, time_sec
+            for face in found:
+                face.update(_visual_quality(cv2, frame, face)[0])
+            return found
+        cartoons = cartoon_faces(frame) if self.include_animation else []
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        hints = (tracked_goggles(self.minion_gray, gray, self.minion_faces)
+                 if self.minion_time is not None and 0 < time_sec-self.minion_time <= .6 else [])
+        minions = minion_faces(frame, hints) if self.include_animation else []
+        self.minion_gray, self.minion_faces, self.minion_time = gray, minions, time_sec
+        # Geometry already finds small stylised faces. One full-frame landmark
+        # pass still covers mixed styles; extra region passes are the fallback.
+        if cartoons:
+            regions = regions[:1]
         candidates = []
         for index, (detector, (x, y, right, bottom)) in enumerate(zip(self.detectors, regions)):
             if hasattr(detector, "detect_all"):
@@ -140,11 +180,53 @@ class MultiRegionFaceLandmarker:
                 det.update(quality, face_detection_region=index)
                 candidates.append(det)
         # Overlapping search regions must not count the same face several times.
-        unique = []
+        unique = cartoons
+        for det in unique:
+            det.update(_visual_quality(cv2, frame, det)[0])
         for det in sorted(candidates, key=lambda d: d.get("mouth_clarity", 0), reverse=True):
             if not any(_same_face(det, other) for other in unique):
                 unique.append(det)
-        return unique
+        return merge_animation_faces(unique, minions)
+
+
+def merge_animation_faces(faces, minions):
+    """Attach automatically verified ensemble identity to an existing face.
+
+    Keep measured human-model mouth landmarks when they belong to the same
+    Minion; otherwise retain the independently measured goggle/mouth face.
+    """
+    from autoedit.video.characters import iou
+    result = [dict(face) for face in faces]
+    for minion in minions:
+        overlaps = [(iou(face['face'], minion['face']), index) for index, face in enumerate(result)]
+        overlap, index = max(overlaps, default=(0, 0))
+        if overlap >= .25:
+            result[index].update(character_group='yellow_minions', group_evidence=minion['face_evidence'])
+        else:
+            result.append(dict(minion))
+    return result
+
+
+def lip_motion_evidence(window):
+    """Require repeated measured shape changes, above cartoon pixel noise."""
+    if len(window) < 3 or any(b["time_sec"]-a["time_sec"] > .6 for a,b in zip(window,window[1:])):
+        return False
+    apertures = [s.get("lip_aperture", 0) for s in window]
+    widths = [s.get("lip_width_ratio", 0) for s in window]
+    cartoon = any(s.get("backend") == "animation-eyes-mouth" for s in window)
+    mouth_width = max(1, min(s.get("mouth_box", [0,0,18,0])[2] for s in window))
+    change = max(.06, 1.5/mouth_width) if cartoon else .015
+    span = max(.12, 2/mouth_width) if cartoon else .04
+    changes = sum(abs(b-a) >= change for a,b in zip(apertures,apertures[1:]))
+    moving = changes >= 2 and max(apertures)-min(apertures) >= span
+    eye_distance = max(1, min(s.get("eye_distance", 30) for s in window))
+    width_change = max(.06, 1.5/eye_distance) if cartoon else .015
+    width_span = max(.12, 2/eye_distance) if cartoon else .04
+    width_changes = sum(abs(b-a) >= width_change for a,b in zip(widths,widths[1:]))
+    # Rounded and wide phonemes can share the same height/width ratio. Their
+    # width relative to the eyes must change, independently of zoom or pan.
+    reshaping = width_changes >= 2 and max(widths)-min(widths) >= width_span
+    return moving or reshaping
 
 
 def annotate_speaking(samples, source_kind="live_action"):
@@ -155,11 +237,13 @@ def annotate_speaking(samples, source_kind="live_action"):
     """
     for sample in samples:
         sample["clear_face"] = float(
-            sample.get("backend") == "mediapipe-landmarks" and sample.get("face_detected")
-            and sample.get("closeup_score", 0) >= 0.25
+            sample.get("backend") in {"mediapipe-landmarks", "animation-eyes-mouth"} and sample.get("face_detected")
+            and (sample.get("closeup_score", 0) >= 0.25 or
+                 (source_kind == "animation" and sample.get("face_evidence") in
+                  {"paired-pupils-shared-colour-mouth", "goggle-pupil-yellow-mouth"}))
             and sample.get("mouth_clarity", 0) >= 0.25
             and sample.get("frontal_score", 0) >= (0.35 if source_kind == "animation" else 0.55)
-            and sample.get("mouth_box", [0, 0, 0, 0])[2] >= 18)
+            and sample.get("mouth_box", [0, 0, 0, 0])[2] >= (4 if sample.get("backend") == "animation-eyes-mouth" else 18))
         sample["speaking"] = 0.0
     from bisect import bisect_left, bisect_right
     times = [sample["time_sec"] for sample in samples]
@@ -173,14 +257,4 @@ def annotate_speaking(samples, source_kind="live_action"):
                   and s.get("shot_id") == sample.get("shot_id")
                   and s.get("track_id") == sample.get("track_id")
                   and _same_face(sample, s)]
-        if len(window) < 3:
-            continue
-        # A cut or missing-face interval must not become apparent lip motion.
-        if any(b["time_sec"] - a["time_sec"] > 0.6 for a, b in zip(window, window[1:])):
-            continue
-        apertures = [s.get("lip_aperture", 0) for s in window]
-        widths = [s.get("lip_width_ratio", 0) for s in window]
-        changes = sum(abs(b - a) >= 0.015 for a, b in zip(apertures, apertures[1:]))
-        moving = changes >= 2 and max(apertures) - min(apertures) >= 0.04
-        reshaping = max(widths) - min(widths) >= 0.04 and max(apertures) - min(apertures) >= 0.025
-        sample["speaking"] = float(moving or reshaping)
+        sample["speaking"] = float(lip_motion_evidence(window))
