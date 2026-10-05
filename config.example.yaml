@@ -21,6 +21,8 @@ audio:
   max_files: 0
 
 video:
+  analysis_mode: until_filled  # stop after a complete verified allocation; full scans every source
+  analysis_chunk_sec: 30
   source_kind: live_action
   source_gap_sec: 5.0
   sample_fps: 6
@@ -37,9 +39,13 @@ video:
   object_detection:
     enabled: auto  # use the installed whole-character model; false keeps face/pose only
     device: auto
+    device_index: 0
+    batch_size: auto  # bounded by free VRAM; CPU uses one image
+    compute_type: float32  # float16 is opt-in; benchmark and review before using
     threshold: 0.3
   characters:
     enabled: true
+    reference_images: []  # optional portraits/group images; [] keeps automatic exposure ranking
     main_group: auto  # automatic exposure ranking; legacy yellow_minions also uses automatic ranking
     device: auto
     device_index: 0

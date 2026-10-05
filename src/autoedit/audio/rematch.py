@@ -44,7 +44,7 @@ def verify_fixed_layout(before, after):
     if len(old) != len(new):
         raise ValueError("Sample-only operation changed track count")
     generated = {"sample_path", "sample_validation", "sample_render_version", "timing_mode",
-                 "source_onset_applied_to_sampler"}
+                 "source_onset_applied_to_sampler", 'midi_lip_sync_verified'}
     for a, b in zip(old, new):
         for field in ("id", "index", "premiere", "video"):
             if a.get(field) != b.get(field):

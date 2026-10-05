@@ -156,7 +156,29 @@ def _merge_segments(
     return segments
 
 
-ANALYSIS_VERSION = 15
+ANALYSIS_VERSION = 16
+
+
+def analysis_prefix(info, end):
+    """A committed prefix with one second of measured right-hand context."""
+    from copy import deepcopy
+    from autoedit.video.faces import annotate_speaking
+    result = deepcopy({k: v for k, v in info.items() if k not in ('samples', 'segments')})
+    result['samples'] = deepcopy([s for s in info['samples'] if s['time_sec'] <= end + 1 + 1e-8])
+    result['analyzed_seconds'] = end
+    result['sample_count'] = len(result['samples'])
+    result['backend_counts'] = dict(Counter(s['backend'] for s in result['samples']))
+    result['analysis_complete'] = end >= info['analyzed_seconds']
+    result['decoded_seconds'] = result['samples'][-1]['time_sec'] if result['samples'] else 0.
+    for key in ('transition_times_sec', 'shot_times_sec'):
+        result[key] = [t for t in result.get(key, []) if t <= end + 1 + 1e-8]
+    annotate_speaking(result['samples'], result.get('source_kind', 'live_action'))
+    settings = info.get('cache_identity') or {}
+    minimum = settings.get('min_segment_sec', .25)
+    gap = settings.get('merge_gap_sec', .20)
+    result['segments'] = bounded_segments(_merge_segments(result['samples'], minimum, gap,
+        sample_interval=1 / result['sample_fps']), end, minimum)
+    return result
 
 
 def analyze_video(
@@ -170,18 +192,23 @@ def analyze_video(
     cache_dir: str | Path | None = None,
     source_kind: str = "live_action",
     main_group: str = "auto",
+    on_chunk: Callable[[dict], bool] | None = None,
+    chunk_sec: float = 30.0,
 ) -> dict[str, Any]:
     import gzip
     import hashlib
     import json
     import math
     import time
+    from copy import deepcopy
     from autoedit.video.faces import FaceLandmarker, MultiRegionFaceLandmarker, MODEL_PATH, annotate_speaking
     from autoedit.video.reader import sampled_frames
     from autoedit.video.pose import PoseLandmarker, MODEL_PATH as POSE_MODEL_PATH
 
     if not math.isfinite(sample_fps) or not 2 <= sample_fps <= 10:
         raise ValueError("Video sampling must be between 2 and 10 fps for temporal lip detection.")
+    if not math.isfinite(chunk_sec) or chunk_sec <= 0:
+        raise ValueError('video.analysis_chunk_sec must be a positive finite number')
     if backend not in {"auto", "mediapipe", "opencv"}:
         raise ValueError("Unknown video backend")
     if source_kind not in {"live_action", "animation"}:
@@ -202,21 +229,44 @@ def analyze_video(
         identity.update(main_group=main_group, main_group_version=4)
     if source_kind == 'animation':
         identity['animation_detector_version'] = 7
+    callback_elapsed = 0.
+    def invoke(info):
+        nonlocal callback_elapsed
+        before = time.perf_counter()
+        try:
+            return on_chunk(info)
+        finally:
+            callback_elapsed += time.perf_counter() - before
     cache = None
+    resume = None
     if cache_dir:
         key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         cache = Path(cache_dir) / (key + ".json.gz")
         if cache.is_file():
+            info = None
             try:
-                info = json.loads(gzip.decompress(cache.read_bytes()))
-                if info.get("cache_identity") == identity:
-                    analyzed_end = min(float(info["duration_sec"]), float(info["analyzed_seconds"]))
-                    info["segments"] = bounded_segments(info.get("segments", []), analyzed_end, min_segment_sec)
-                    if progress:
-                        progress("Video analysis cache hit: reusing face/lip samples; no video rescan.")
-                    return info
-            except (OSError, ValueError, EOFError):
+                loaded = json.loads(gzip.decompress(cache.read_bytes()))
+                if loaded.get('cache_identity') == identity:
+                    analyzed_end = min(float(loaded['duration_sec']), float(loaded['analyzed_seconds']))
+                    loaded['segments'] = bounded_segments(loaded.get('segments', []), analyzed_end, min_segment_sec)
+                    info = loaded
+            except (OSError, ValueError, EOFError, KeyError):
                 pass
+            if info:
+                if progress:
+                    progress('Video analysis cache hit: reusing completed face/lip evidence')
+                if info.get('analysis_complete', True):
+                    if on_chunk:
+                        end = min(chunk_sec, analyzed_end)
+                        while True:
+                            prefix = analysis_prefix(info, end)
+                            if invoke(prefix) or end >= analyzed_end:
+                                return prefix
+                            end = min(end + chunk_sec, analyzed_end)
+                    return info
+                resume = info
+                if on_chunk and invoke(deepcopy(resume)):
+                    return resume
 
     cv2, np = _try_cv2()
     detector = pose = None
@@ -253,11 +303,15 @@ def analyze_video(
                          "mediapipe-landmarks" if detector else "opencv-diagnostic")
         progress(f"Video scan: {duration / 60:.1f} min, {sample_fps:g} samples/s, sequential decoder, backend={detector_name}")
     started = last_report = time.perf_counter()
-    samples = []
-    backends = Counter()
+    callback_elapsed = 0.
+    samples = deepcopy(resume['samples']) if resume else []
+    backends = Counter(s["backend"] for s in samples)
     previous_gray = previous_det = None
     from autoedit.video.transitions import TransitionDetector
     transitions = TransitionDetector()
+    if resume:
+        transitions.events = list(resume.get('transition_times_sec', []))
+        transitions.shot_events = list(resume.get('shot_times_sec', []))
     from autoedit.video.tracking import FaceFeatureTracker
     tracker = FaceFeatureTracker()
     previous_sample_time = -1.
@@ -269,8 +323,34 @@ def analyze_video(
             decoded = decoded.reformat(width=width, height=max(2,round(decoded.height*width/decoded.width)),format='bgr24')
         tracker.update(decoded.to_ndarray(format='bgr24'), t, [],
                        cut=any(tracker.last_time < event <= t for event in transitions.events))
+    resume_time = samples[-1]['time_sec'] if samples else -1.
+    warm_start = max(0., resume_time - 1.)
+    next_boundary = min((float(resume['analyzed_seconds']) if resume else 0.) + chunk_sec, limit)
+    stopped = None
+
+    def snapshot(end, complete=False):
+        measured = deepcopy(samples)
+        annotate_speaking(measured, source_kind=source_kind)
+        elapsed = time.perf_counter() - started - callback_elapsed
+        info = {'path': str(src), 'duration_sec': duration, 'fps': fps, 'sample_fps': sample_fps,
+                'analyzed_seconds': end, 'decoded_seconds': measured[-1]['time_sec'] if measured else 0,
+                'sample_count': len(measured), 'samples': measured, 'source_kind': source_kind,
+                'segments': bounded_segments(_merge_segments(measured, min_segment_sec, merge_gap_sec,
+                    sample_interval=1/sample_fps), end, min_segment_sec),
+                'backend_counts': dict(Counter(s['backend'] for s in measured)),
+                'analysis_elapsed_sec': round(elapsed, 3), 'cache_identity': identity,
+                'analysis_complete': complete, 'quality_method': 'multiregion-verified-face-tracks-v9',
+                'transition_times_sec': sorted(set(transitions.events)), 'transition_method': 'motion-verified-shot-local-v4',
+                'shot_times_sec': sorted(set(transitions.shot_events)), 'shot_method': 'adjacent-frame-histogram-v1'}
+        if cache:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            temporary = cache.with_suffix('.tmp')
+            temporary.write_bytes(gzip.compress(json.dumps(info).encode()))
+            temporary.replace(cache)
+        return info
+
     frames = sampled_frames(src, sample_fps, limit, transition_detector=transitions,
-                            between_samples=track_between_samples)
+                            between_samples=track_between_samples, start_sec=warm_start)
     try:
         for t, frame in frames:
             det = detector.detect(frame, t) if detector else _detect_opencv(cv2, np, frame)
@@ -290,9 +370,18 @@ def analyze_video(
             det.update(pose.detect(frame, t) if pose else {"person_detected": False, "pose_confirmed": False, "person_box": None, "shot_scale": None})
             det["person_visible"] = float(det["person_detected"])
             det["time_sec"] = t
+            if t <= resume_time + 1e-8:
+                previous_det = det
+                continue
             samples.append(det)
             previous_det = det
             backends[det["backend"]] += 1
+            if on_chunk and next_boundary < limit and t + 1e-8 >= next_boundary + 1:
+                checkpoint = snapshot(next_boundary)
+                if invoke(checkpoint):
+                    stopped = checkpoint
+                    break
+                next_boundary = min(next_boundary + chunk_sec, limit)
             now = time.perf_counter()
             if progress and now - last_report >= 3:
                 elapsed = now - started
@@ -307,7 +396,11 @@ def analyze_video(
         if detector:
             detector.close()
     annotate_speaking(samples, source_kind=source_kind)
-    elapsed = time.perf_counter() - started
+    if stopped is not None:
+        if progress:
+            progress(f'Stopped source analysis at {stopped["analyzed_seconds"]:.1f}s: all slots verified')
+        return stopped
+    elapsed = time.perf_counter() - started - callback_elapsed
     actual_end = min(limit, samples[-1]["time_sec"] + 1 / sample_fps) if samples else 0
     if actual_end + 1 / sample_fps < limit:
         raise RuntimeError(f"Video decode ended early at {actual_end:.1f}/{limit:.1f}s; incomplete analysis was not cached.")
@@ -321,10 +414,13 @@ def analyze_video(
             "samples": samples, "source_kind": source_kind, "quality_method": "multiregion-verified-face-tracks-v9",
             "analysis_elapsed_sec": round(elapsed, 3), "cache_identity": identity,
             "transition_times_sec": sorted(set(transitions.events)), "transition_method": "motion-verified-shot-local-v4",
-            "shot_times_sec": sorted(set(transitions.shot_events)), "shot_method": "adjacent-frame-histogram-v1"}
+            "shot_times_sec": sorted(set(transitions.shot_events)), "shot_method": "adjacent-frame-histogram-v1",
+            "analysis_complete": True, "decoded_seconds": actual_end}
     if cache:
         cache.parent.mkdir(parents=True, exist_ok=True)
         temporary = cache.with_suffix(".tmp")
         temporary.write_bytes(gzip.compress(json.dumps(info).encode()))
         temporary.replace(cache)
+    if on_chunk:
+        invoke(deepcopy(info))
     return info

@@ -25,6 +25,8 @@ DEFAULTS: dict[str, Any] = {
     },
     "audio": {"directory": r"D:\Editor\Voice", "glob": "*.wav", "files": [], "max_files": 0},
     "video": {
+        "analysis_mode": "until_filled",
+        "analysis_chunk_sec": 30,
         "sample_fps": 6,
         "max_seconds": 0,
         "source_kind": "live_action",

@@ -80,6 +80,9 @@ def match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requir
     """Try a complete primary allocation, then retain exposure order on fallback."""
     character_analysis = video_info.get("character_analysis") or {}
     levels = ((0, 1), (2, None)) if character_analysis else ((None, None),)
+    reference_active = bool(character_analysis.get('reference'))
+    if reference_active:
+        levels = ((None, None),)
     track_candidates = _face_track_candidates(slots, video_info, require_lip_motion, min_tier)
     last_error = None
     for level, rank_limit in levels:
@@ -242,7 +245,7 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
     if any(not math.isfinite(n) or n <= 0 for n in needs):
         raise ValueError("Invalid nested clip duration.")
     if sum(needs) + gap * max(0, len(slots) - 1) > duration + 1e-8:
-        raise ValueError(f"Not enough analyzed source footage for full cuts with {gap:g}s gaps. Analyze more video or reduce Source gap.")
+        raise InsufficientFootageError(f"Not enough analyzed source footage for full cuts with {gap:g}s gaps. Analyze more video or reduce Source gap.")
 
     samples = sorted(video_info.get("samples") or [], key=lambda s: s["time_sec"])
     times = np.array([s["time_sec"] for s in samples])
@@ -300,6 +303,18 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
     used = []
     matches = [None] * len(slots)
     candidate_options = {}
+    reference_counts, reference_seconds = {}, {}
+
+    def reference_usage(row, counts, seconds):
+        character = row[3].get('character_selection', {})
+        rid = character.get('reference_id')
+        return (counts.get(rid, 0), seconds.get(rid, 0.)) if rid else (0, 0.)
+
+    def credit_reference(row, need, counts, seconds):
+        rid = row[3].get('character_selection', {}).get('reference_id')
+        if rid:
+            counts[rid] = counts.get(rid, 0) + 1
+            seconds[rid] = seconds.get(rid, 0.) + need
     # Reserve long uninterrupted windows before short cuts consume them.
     # Keep original indices for audio, source spread and returned timeline order.
     selection_order = sorted(range(len(slots)), key=lambda index: (-needs[index], index))
@@ -368,6 +383,9 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
             # another sound while keeping the original WAV assignment.
             candidates.update(t for t, sound in sound_by_start.items()
                               if left <= t and t+need <= right+1e-8 and sound["end"] <= t+need)
+        fixed = (video_info.get('fixed_starts') or {}).get(slot['id'])
+        if fixed is not None:
+            candidates = {float(fixed)} if any(left <= fixed and fixed+need <= right+1e-8 for left,right in free) else set()
         ranked = []
         for start in candidates:
             end = start + need
@@ -411,6 +429,15 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
                         if rank <= character_rank_limit) < cast['min_main_fraction']:
                     continue
                 measured["character_selection"] = character
+            if (video_info.get('character_analysis') or {}).get('reference'):
+                cast = video_info['character_analysis']
+                character = cut_character_metrics(samples[first:after+1], start, end,
+                    sample_interval + frame_slack, cast['min_main_fraction'])
+                if character['decision'] == 'reject':
+                    continue
+                if video_info.get('reference_only') and character['reference_fraction'] < cast['min_main_fraction']:
+                    continue
+                measured['character_selection'] = character
             measured["tier"] = tier
             measured["subject_evidence"] = ("face-throughout" if all(_has_face(s) for s in samples[first:after + 1])
                                             else "face-or-confirmed-body-throughout")
@@ -428,10 +455,17 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
             score = quality + category_bonus + 0.8 * spread + 0.8 * diversity
             ranked.append((score, start, seg, measured))
         for start, measured in (track_candidates or {}).get(need, []):
+            if fixed is not None and abs(start-fixed) > 1e-8:
+                continue
             end=start+need
             if not any(left-1e-8 <= start and end <= right+1e-8 for left,right in free):
                 continue
             character=measured.get('character_selection')
+            if (video_info.get('character_analysis') or {}).get('reference'):
+                if not character or character['decision'] == 'reject':
+                    continue
+                if video_info.get('reference_only') and character.get('reference_fraction', 0) < video_info['character_analysis']['min_main_fraction']:
+                    continue
             if character_level is not None and character and {
                     'main':0,'uncertain':1,'supporting':2,'reject':3}[character['decision']] > character_level:
                 continue
@@ -459,6 +493,10 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
             # A momentary appearance cannot promote the entire cut's rank.
             return min(ranks, default=1000000)
         ranked.sort(key=lambda row: (
+            (0 if row[3].get('character_selection', {}).get('reference_fraction', 0)
+                  >= (video_info.get('character_analysis') or {}).get('min_main_fraction', .85) else 1)
+            if (video_info.get('character_analysis') or {}).get('reference') else 0,
+            reference_usage(row, reference_counts, reference_seconds),
             # A recognized primary view with uncertain identity still precedes
             # a known secondary actor; its uncertainty stays visible for review.
             exposure_rank(row),
@@ -486,12 +524,13 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
         score, start, seg, metrics, free = chosen
         end = start + need
         used.append((start, end))
+        credit_reference((score, start, seg, metrics), need, reference_counts, reference_seconds)
         matches[i] = make_match(i, score, start, seg, metrics)
     if allocation_search:
         # Forward checking starts with the slot with fewest available choices.
         # Cache failed states and bound exploration on highly ambiguous inputs.
         failed, nodes = set(), 0
-        def search(remaining, intervals):
+        def search(remaining, intervals, counts, seconds):
             nonlocal nodes
             if not remaining:
                 return {}
@@ -525,15 +564,23 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
                     return None
             index = min(remaining, key=lambda j: (len(available[j]), -needs[j], j))
             following = tuple(j for j in remaining if j != index)
-            for row in available[index]:
+            # Keep reference preference before diversity, including fallback.
+            # Stable sorting retains the original quality/exposure ordering.
+            choices = sorted(available[index], key=lambda row: (
+                0 if row[3].get('character_selection', {}).get('reference_id') else 1,
+                reference_usage(row, counts, seconds))) if character_analysis_reference else available[index]
+            for row in choices:
                 start = row[1]
-                result = search(following, subtract(intervals, start-gap, start+needs[index]+gap))
+                next_counts, next_seconds = dict(counts), dict(seconds)
+                credit_reference(row, needs[index], next_counts, next_seconds)
+                result = search(following, subtract(intervals, start-gap, start+needs[index]+gap), next_counts, next_seconds)
                 if result is not None:
                     result[index] = row
                     return result
             failed.add(state)
             return None
-        allocation = search(tuple(selection_order), free)
+        character_analysis_reference = bool((video_info.get('character_analysis') or {}).get('reference'))
+        allocation = search(tuple(selection_order), free, {}, {})
         if allocation is None:
             speech_note = " Visible lip movement is required; static faces are excluded." if require_lip_motion else ""
             raise InsufficientFootageError("Not enough qualifying footage with a visible person throughout: "

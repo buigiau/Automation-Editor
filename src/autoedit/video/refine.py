@@ -7,6 +7,22 @@ from bisect import bisect_right
 
 def refine_selected_cuts(path, video_slots, cache_dir, progress=None, sample_fps=20, source_kind="live_action",
                          character_samples=None, main_group="auto"):
+    """Cache each cut independently so changing an allocation reuses other cuts."""
+    samples, ranges = [], []
+    unique = {}
+    for slot in video_slots:
+        unique[(slot['video']['in_sec'], slot['video']['out_sec'],
+                (slot['video'].get('selection_metrics') or {}).get('subject_track_id'))] = slot
+    for slot in sorted(unique.values(), key=lambda s: s['video']['in_sec']):
+        info = _refine_ranges(path, [slot], cache_dir, progress, sample_fps, source_kind, character_samples, main_group)
+        samples.extend(info['samples'])
+        ranges.extend(info['ranges'])
+    return {'samples': samples, 'sample_fps': sample_fps, 'method': 'selected-lips-20fps',
+            'ranges': ranges, 'path': str(Path(path).resolve())}
+
+
+def _refine_ranges(path, video_slots, cache_dir, progress=None, sample_fps=20, source_kind="live_action",
+                   character_samples=None, main_group="auto"):
     import av
     from autoedit.video.faces import FaceLandmarker, MultiRegionFaceLandmarker, MODEL_PATH, annotate_speaking
     from autoedit.video.analyzer import _visual_quality, _try_cv2
@@ -16,10 +32,10 @@ def refine_selected_cuts(path, video_slots, cache_dir, progress=None, sample_fps
                            for slot in video_slots for start,end in [(slot['video']['in_sec'],slot['video']['out_sec'])]}
     references = [s for refs in references_by_range.values() for s in refs]
     reference_identity = [{k: s.get(k) for k in ("time_sec", "face", "frame_width", "frame_height",
-                                                "character_id", "track_id", "shot_id", "reference_range")}
+                                                "reference_range")}
                           for s in references]
     identity = [str(source), source.stat().st_size, source.stat().st_mtime_ns, ranges, sample_fps,
-                source_kind, MODEL_PATH.stat().st_mtime_ns if MODEL_PATH.is_file() else None, reference_identity, 8]
+                source_kind, MODEL_PATH.stat().st_mtime_ns if MODEL_PATH.is_file() else None, reference_identity, 11]
     if main_group != "auto":
         identity.append({"main_group":main_group,"version":4})
     if source_kind == 'animation':
@@ -27,7 +43,16 @@ def refine_selected_cuts(path, video_slots, cache_dir, progress=None, sample_fps
     key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
     dest = Path(cache_dir) / ("lips-" + key + ".json")
     if dest.is_file():
-        return json.loads(dest.read_text(encoding="utf-8"))
+        try:
+            info = json.loads(dest.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            info = None
+        if info is not None:
+            if character_samples is not None:
+                times = [s['time_sec'] for s in references]
+                info['samples'] = [{**s, **select_reference_face([s] if s.get('face_detected') else [],
+                    s['frame_width'], s['frame_height'], s['time_sec'], references, times)} for s in info['samples']]
+            return info
     if progress:
         progress(f"Refining lips at {sample_fps} samples/s for {len(ranges)} selected cuts only")
     cv2, _ = _try_cv2()
@@ -44,15 +69,16 @@ def refine_selected_cuts(path, video_slots, cache_dir, progress=None, sample_fps
             for start, end in ranges:
                 range_references = references_by_range[(start,end)]
                 reference_times = [s['time_sec'] for s in range_references]
-                container.seek(int((start + origin) / float(stream.time_base)), stream=stream, backward=True)
-                next_time = start
+                context_start, context_end = max(0., start-.35), end+.35
+                container.seek(int((context_start + origin) / float(stream.time_base)), stream=stream, backward=True)
+                next_time = context_start
                 for frame in container.decode(stream):
                     if frame.time is None:
                         continue
                     t = float(frame.time) - origin
-                    if t >= end:
+                    if t >= context_end:
                         break
-                    if t + 1e-6 < next_time:
+                    if t < context_start or (not start-.25 <= t <= start+.55 and t + 1e-6 < next_time):
                         continue
                     frame = frame.reformat(width=960, height=round(frame.height * 960/frame.width), format="bgr24")
                     image = frame.to_ndarray(format="bgr24")
@@ -63,8 +89,10 @@ def refine_selected_cuts(path, video_slots, cache_dir, progress=None, sample_fps
                     quality, _ = _visual_quality(cv2, image, det)
                     det.update(quality)
                     det["time_sec"] = t
+                    det['refinement_cut'] = {'in_sec': start, 'out_sec': end}
+                    det['frame_width'], det['frame_height'] = image.shape[1], image.shape[0]
                     samples.append(det)
-                    next_time += 1/sample_fps
+                    next_time = t + 1/sample_fps
     finally:
         detector.close()
     annotate_speaking(samples, source_kind=source_kind)
@@ -115,4 +143,7 @@ def select_reference_face(faces, width, height, time, references, reference_time
         return missing
     if len(ordered) > 1 and iou(selected["face"], expected) - iou(ordered[1]["face"], expected) < .1:
         return missing
-    return {**selected, **{k: reference.get(k) for k in ("character_id", "track_id", "shot_id")}}
+    return {**selected, **{k: reference.get(k) for k in ("character_id", "track_id", "shot_id",
+                                                      'reference_match', 'reference_confidence',
+                                                      'reference_id', 'reference_template_id',
+                                                      'reference_ambiguous')}}

@@ -52,6 +52,44 @@ template     ──► premiere inspector ──► slots (nested seqs, times, t
 | `plugins/premiere-uxp` | Apply plan inside Premiere via official UXP | Premiere |
 | `autoedit.cubase` | Sampler WAVs, verified Cubase 13 track-archive import, timing preview | Cubase needed to load samples and render MIDI/FX |
 
+## Incremental completion
+
+`until_filled` is the default pipeline mode. The video analyzer retains a live
+decoder/detector session and offers cumulative snapshots every 30 source seconds,
+with one second of right-hand context. The callback enriches new frames with
+object evidence, updates identities and tries the full Premiere allocation,
+including any empty intro. Only a verified allocation with valid sampler bindings
+can stop analysis. Insufficient footage/dense lip rejection continues the scan;
+invalid inputs, models and runtime errors abort it. Sources are visited in input
+order until enough footage is verified. `full` retains whole-source analysis.
+
+Character exposure is measured over each analyzed prefix. Checkpoint metadata
+distinguishes committed source duration from decoded context and records the
+stop reason. Chunk boundaries are not shot boundaries. Prefix expansion reuses
+independent object observations and crop embeddings while recomputing tracks and
+cast ranking. Strict lip failures persist as source-local rejected intervals.
+
+Optional reference images are analyzed once per content/model fingerprint and
+cached independently of video embeddings. Group images provide separate face
+templates; complete-link grouping merges only strongly matching alternate views,
+with reference-image co-occurrence constraints. Each video track must match one
+target consistently across multiple crops. Ambiguous identities are excluded.
+Cuts integrate identity evidence for one dominant reference target rather than
+aggregating unrelated imported characters. Both greedy and bounded allocation
+prefer least-used eligible targets, while retaining full duration, gap, speech
+and transition validation. This is best-effort diversity, not a quota that extends
+the sequential scan. Reference-only allocation runs before fallback; fallback
+is enabled only after configured sources/limits are exhausted. Multi-source
+pooling canonicalizes template provenance across models conservatively and does
+not prefix reference IDs. Final plan metadata reports selected cuts and duration
+per target; timeline slot order and project length remain unchanged.
+
+Audio uses stable overlapping core windows with one owner for each word/event.
+Dense lip caches belong to individual cuts and their geometry, independently of
+cast rank labels. Raw analysis checkpoints are atomic and may be resumed after a
+one-second state warmup. Final video-only assets are made only after verification
+and only for used sources; their original packet timestamps remain unchanged.
+
 ## MVP vs later
 
 MVP (this tree):

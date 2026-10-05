@@ -151,9 +151,9 @@ def test_pipeline_preserves_sources_through_lip_checks_audio_and_premiere(tmp_pa
     def refine(path, selected, *a, **kw):
         refined.append((path, selected))
         assert all(0 <= s["video"]["in_sec"] < s["video"]["out_sec"] <= 5 for s in selected)
-        return {"samples": [{"time_sec": s["video"]["in_sec"]+i/20, "clear_face": 1,
-                             "speaking": 1, "lip_aperture": .05 if i % 2 else .3,
-                             "lip_width_ratio": .5, "category": "A"} for s in selected for i in range(80)]}
+        from test_audio_onsets import lip_samples
+        return {'samples': [sample for s in selected for sample in lip_samples(s['video']['in_sec'],
+            s['video']['out_sec'], 'O' if word_matched and path == 'second.mp4' else 'A')]}
 
     monkeypatch.setattr(pipeline, "transcribe_source", transcribe)
     monkeypatch.setattr(pipeline, "refine_selected_cuts", refine)

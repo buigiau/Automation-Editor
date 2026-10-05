@@ -173,14 +173,79 @@ def merge_subjects(sample, objects, props=()):
     return result
 
 
-def _cached_object_scan(info, cache_dir, settings, progress):
+class ObjectScanSession:
+    """One isolated worker per job; models and bounded decoded frames survive queries."""
+
+    def __init__(self):
+        self.process = None
+
+    def __enter__(self):
+        return self
+
+    def run(self, command, request, progress, log_path):
+        if self.process is None:
+            self.process = subprocess.Popen([command[0], command[1], '--serve'],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding='utf-8', errors='replace', bufsize=1,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        self.process.stdin.write(json.dumps(str(request.resolve())) + '\n')
+        self.process.stdin.flush()
+        tail = []
+        with log_path.open('w', encoding='utf-8') as logfile:
+            for line in self.process.stdout:
+                logfile.write(line)
+                tail = (tail + [line.strip()])[-12:]
+                if line.startswith('OBJECT: ') and progress:
+                    progress(line[8:].strip())
+                if line.startswith('RESULT: '):
+                    status = json.loads(line[8:])
+                    if status.get('error'):
+                        raise RuntimeError('Whole-character detector failed: ' + status['error'])
+                    return
+        raise RuntimeError('Whole-character worker exited; log: ' + str(log_path) + '\n' + '\n'.join(tail))
+
+    def __exit__(self, *args):
+        if self.process is not None:
+            try:
+                self.process.stdin.close()
+                self.process.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                self.process.kill()
+                self.process.wait()
+
+    def offload(self):
+        """Keep weights in host memory while other inference runtimes use the GPU."""
+        if self.process is None:
+            return
+        self.process.stdin.write(json.dumps({'action': 'offload'}) + '\n')
+        self.process.stdin.flush()
+        for line in self.process.stdout:
+            if line.startswith('RESULT: '):
+                status = json.loads(line[8:])
+                if status.get('error'):
+                    raise RuntimeError('Whole-character offload failed: ' + status['error'])
+                return
+        raise RuntimeError('Whole-character worker exited during offload')
+
+
+def _cached_object_scan(info, cache_dir, settings, progress, session=None):
     """Cache each query independently so adding prop checks preserves actor work."""
-    identity = {'source':info.get('cache_identity'),**settings,
+    source_identity = info.get('cache_identity') or {}
+    if 'regional_requests' in source_identity:
+        source_identity = source_identity['source']
+    identity = {'source':source_identity, 'path':str(Path(info['path']).resolve()), **settings,
                 'model_mtime':(MODEL_DIR/'model.safetensors').stat().st_mtime_ns}
+    samples = info['samples']
+    if len({s['time_sec'] for s in samples}) != len(samples):
+        raise RuntimeError('Whole-character detector received incomplete or duplicate timestamps')
+    def sample_key(s):
+        value = [s['time_sec'], s['frame_width'], s['frame_height'], s.get('roi'), s.get('query')]
+        return hashlib.sha256(json.dumps(value).encode()).hexdigest()
     key = hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest()
     directory=Path(cache_dir)
     directory.mkdir(parents=True,exist_ok=True)
-    cache=directory/f'objects-{key}.json.gz'
+    cache=directory/f'objects-{key}-frames.json.gz'
+    saved = {'rows':{}, 'elapsed_sec':0., 'runtime':None}
     def validate(data):
         if len(data['samples']) != len(info['samples']):
             raise RuntimeError('Whole-character detector returned incomplete analysis')
@@ -188,7 +253,12 @@ def _cached_object_scan(info, cache_dir, settings, progress):
                for sample,row in zip(info['samples'],data['samples'])):
             raise RuntimeError('Whole-character detection timestamp mismatch')
     if cache.is_file():
-        data=json.loads(gzip.decompress(cache.read_bytes()))
+        try:
+            saved=json.loads(gzip.decompress(cache.read_bytes()))
+        except (OSError, ValueError, EOFError):
+            pass
+    missing = [s for s in samples if sample_key(s) not in saved['rows']]
+    if not missing:
         if progress:
             progress('Whole-character cache hit: reusing independent object detections')
     else:
@@ -197,28 +267,40 @@ def _cached_object_scan(info, cache_dir, settings, progress):
         request.write_text(json.dumps({'path':info['path'],'samples':[
             {'time_sec':s['time_sec'],'width':s['frame_width'],'height':s['frame_height'],
              **({'roi':s['roi'],'query':s.get('query')} if s.get('roi') else {})}
-            for s in info['samples']], 'model_dir':str(MODEL_DIR),'settings':settings,
+            for s in missing], 'model_dir':str(MODEL_DIR),'settings':settings,
             'result':str(result.resolve())}),encoding='utf-8')
         command=[str(RUNTIME),str(Path(__file__).with_name('object_worker.py')),str(request.resolve())]
-        process=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
-                                 text=True,encoding='utf-8',errors='replace')
         log_path=directory/f'objects-{key}.log'
-        tail=[]
-        with log_path.open('w',encoding='utf-8') as log:
-            for line in process.stdout:
-                log.write(line)
-                tail=(tail+[line.strip()])[-12:]
-                if progress and line.startswith('OBJECT: '):
-                    progress(line[8:].strip())
-        if process.wait():
-            raise RuntimeError(f'Whole-character detector failed; log: {log_path}\n'+ '\n'.join(tail))
+        if session is not None:
+            session.run(command, request, progress, log_path)
+        else:
+            process=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
+                                     text=True,encoding='utf-8',errors='replace',
+                                     creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            tail=[]
+            with log_path.open('w',encoding='utf-8') as log:
+                for line in process.stdout:
+                    log.write(line)
+                    tail=(tail+[line.strip()])[-12:]
+                    if progress and line.startswith('OBJECT: '):
+                        progress(line[8:].strip())
+            if process.wait():
+                raise RuntimeError(f'Whole-character detector failed; log: {log_path}\n'+ '\n'.join(tail))
         data=json.loads(result.read_text(encoding='utf-8'))
-        validate(data)
+        if len(data['samples']) != len(missing) or any(abs(s['time_sec']-r['time_sec']) > 1e-5
+                for s,r in zip(missing,data['samples'])):
+            raise RuntimeError('Whole-character detector returned incomplete analysis or mismatched timestamps')
+        saved['rows'].update({sample_key(s):row for s,row in zip(missing,data['samples'])})
+        saved['runtime'] = data.get('runtime')
+        saved['elapsed_sec'] = (saved['elapsed_sec'] + data['elapsed_sec']
+                               if saved['elapsed_sec'] is not None and data.get('elapsed_sec') is not None else None)
         temporary=cache.with_suffix('.tmp')
-        temporary.write_bytes(gzip.compress(json.dumps(data).encode()))
+        temporary.write_bytes(gzip.compress(json.dumps(saved).encode()))
         temporary.replace(cache)
+    data = {'samples':[saved['rows'][sample_key(s)] for s in samples],
+            'runtime':saved['runtime'], 'elapsed_sec':saved['elapsed_sec']}
     validate(data)
-    return data,identity
+    return data,{**identity, 'sample_keys':[sample_key(s) for s in samples]}
 
 
 def _regional_requests(samples, observations, transitions, threshold, positive_labels=None):
@@ -262,7 +344,7 @@ def _regional_requests(samples, observations, transitions, threshold, positive_l
     return result
 
 
-def augment_with_objects(info, cache_dir, config=None, progress=None):
+def augment_with_objects(info, cache_dir, config=None, progress=None, session=None):
     config = config or {}
     mode = config.get('enabled','auto')
     if mode != 'auto' and not isinstance(mode,bool):
@@ -283,7 +365,11 @@ def augment_with_objects(info, cache_dir, config=None, progress=None):
         raise ValueError('Object detection threshold must be between .3 and .9')
     settings = {'threshold':threshold, 'prompt':config.get('prompt') or DEFAULT_PROMPT,
                 'device':config.get('device','auto'),'version':OBJECT_VERSION}
-    data,identity = _cached_object_scan(info,cache_dir,settings,progress)
+    for field in ('batch_size', 'compute_type', 'device_index'):
+        if field in config:
+            settings[field] = config[field]
+    scan_args = (session,) if session is not None else ()
+    data,identity = _cached_object_scan(info,cache_dir,settings,progress,*scan_args)
     primary = None
     primary_identity = None
     if not config.get('prompt'):
@@ -292,7 +378,7 @@ def augment_with_objects(info, cache_dir, config=None, progress=None):
         # Actor-only inference uses the unchanged v1 raw-box schema. Its cache
         # is independent of later additions to contextual/negative labels.
         actor_settings={**settings,'prompt':ACTOR_PROMPT,'version':1}
-        primary,primary_identity = _cached_object_scan(info,cache_dir,actor_settings,progress)
+        primary,primary_identity = _cached_object_scan(info,cache_dir,actor_settings,progress,*scan_args)
     observations=[{'objects':row['objects']+(primary['samples'][index]['objects'] if primary else [])}
                   for index,row in enumerate(data['samples'])]
     requests=_regional_requests(info['samples'],observations,sorted(info.get('transition_times_sec') or []),
@@ -305,7 +391,7 @@ def augment_with_objects(info, cache_dir, config=None, progress=None):
         regional_info={**info,'samples':requests,'cache_identity':{'source':info.get('cache_identity'),
                       'regional_requests':requests,'regional_version':2}}
         regional_data,regional_identity=_cached_object_scan(regional_info,cache_dir,
-            {**settings,'prompt':config.get('prompt') or ACTOR_PROMPT,'version':1},progress)
+            {**settings,'prompt':config.get('prompt') or ACTOR_PROMPT,'version':1},progress,*scan_args)
         by_time={sample['time_sec']:index for index,sample in enumerate(info['samples'])}
         for request,row in zip(requests,regional_data['samples']):
             observations[by_time[row['time_sec']]]['objects'].extend(
