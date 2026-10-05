@@ -95,6 +95,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     from autoedit.pipeline import run_pipeline
 
     cfg = load_config(args.config)
+    if getattr(args, 'character_reference', None) is not None:
+        cfg.setdefault('video', {}).setdefault('characters', {})['reference_images'] = args.character_reference
+    if args.analysis_mode is not None:
+        cfg.setdefault('video', {})['analysis_mode'] = args.analysis_mode
+    if args.analysis_chunk_sec is not None:
+        cfg.setdefault('video', {})['analysis_chunk_sec'] = args.analysis_chunk_sec
     if args.source_kind:
         cfg.setdefault("video", {})["source_kind"] = args.source_kind
     if args.source_gap is not None:
@@ -196,7 +202,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--audio-dir", help="Folder of short voice WAV files")
     s.add_argument("--source-kind", choices=["live_action", "animation"], help="Animation uses neutral voices when no source word matches")
     s.add_argument("--source-gap", type=float, help="Minimum seconds between selected source ranges (default 5)")
+    s.add_argument('--analysis-mode', choices=['until_filled', 'full'], help='Stop when all slots are verified, or analyze every source')
+    s.add_argument('--analysis-chunk-sec', type=float, help='Source seconds between allocation checks (default 30)')
     s.add_argument("--main-group", choices=["auto", "yellow_minions"], help=argparse.SUPPRESS)
+    s.add_argument('--character-reference', action='append', help='Character portrait or group image; repeat for more characters or alternate views. Omit for automatic selection.')
     s.add_argument("--sampler-tracks", help="Sampler numbers to fill, e.g. 2-13 or 1,3-5; omitted keeps configured mapping")
     s.add_argument("-o", "--output-dir")
     s.set_defaults(func=cmd_run)

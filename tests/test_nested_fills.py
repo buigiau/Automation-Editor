@@ -98,7 +98,8 @@ def test_pipeline_audio_count_never_changes_video_slot_count(tmp_path, monkeypat
         selection_arguments.append(kwargs)
         return match_slots_to_video(targets, *args, **kwargs)
     monkeypatch.setattr(pipeline, 'match_slots_to_video', select)
-    audio = [{"id": str(i), "path": f"{i}.wav", "duration_sec": 0.1, "category": "HI", "group": "NEUTRAL"} for i in range(100)]
+    audio = [{"id": str(i), "path": f"{i}.wav", "duration_sec": 0.1, "category": "HI", "group": "NEUTRAL",
+              'phonetics':{'action':'SPEECH','visemes':['A','E']}} for i in range(100)]
     monkeypatch.setattr(pipeline, "inspect_sampler_tracks", lambda path: {
         "path": path, "tracks": [{"index": 1, "name": "Sampler Track 01"}]})
     monkeypatch.setattr(pipeline, "require_inputs", lambda **kwargs: None)
@@ -164,16 +165,18 @@ def test_pipeline_reselects_static_dense_cut_before_assigning_any_voice(tmp_path
     def refine(path, slots, *args, **kwargs):
         cuts = [s['video'] for s in slots]
         refined.append(cuts)
-        return {'samples':[
-            {**face(), 'time_sec':cut['in_sec']+i/20, 'clear_face':1,'speaking':1,
-             'lip_width_ratio':.5, 'lip_aperture':(.05 if i%2 else .3) if len(refined)>1 else .2}
-            for cut in cuts for i in range(round((cut['out_sec']-cut['in_sec'])*20))]}
+        from test_audio_onsets import lip_samples
+        samples = [sample for cut in cuts for sample in lip_samples(cut['in_sec'], cut['out_sec'])]
+        if len(refined) == 1:
+            for sample in samples:
+                sample['lip_aperture'] = .2
+        return {'samples':samples}
     monkeypatch.setattr(pipeline, 'refine_selected_cuts', refine)
     result = pipeline.run_pipeline({'job':{'output_dir':str(tmp_path/'output')},
         'premiere':{'project':'template.prproj','source_media':'source.mp4'},
         'cubase':{'project':'template.cpr'},
         'video':{'source_gap_sec':0,'require_lip_motion':True,'characters':{'enabled':False}}})
-    assert len(refined) == 2
+    assert len(refined) >= 2  # the alternative may need a further onset alignment check
     old, final = refined[0][0], result['plan']['slots'][0]['video']
     assert final['out_sec'] <= old['in_sec'] or final['in_sec'] >= old['out_sec']
     assert final['used_duration_sec'] == old['used_duration_sec'] == 4

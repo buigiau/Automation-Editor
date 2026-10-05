@@ -25,11 +25,18 @@ DEFAULTS = {
     "device": "auto", "device_index": 0,
     "main_group": "auto",
     "embedding_model": "auto",
+    "reference_images": [],
 }
 
 
 def settings(config=None):
     result = {**DEFAULTS, **(config or {})}
+    references = result['reference_images']
+    if not isinstance(references, list) or any(not isinstance(p, str) or not p.strip() for p in references):
+        raise ValueError('video.characters.reference_images must be a list of image paths')
+    result['reference_images'] = list(dict.fromkeys(references))
+    if references:
+        result['enabled'] = True
     device_settings(result["device"], result["device_index"])
     if not isinstance(result["enabled"], bool):
         raise ValueError("video.characters.enabled must be true or false")
@@ -176,12 +183,15 @@ def _selected_source_frames(path, times):
     """Second sequential decode; materialize only requested full-resolution frames."""
     import av
     position = 0
+    if not times:
+        return
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
         stream.codec_context.thread_count = 4
         origin = float(stream.start_time * stream.time_base) if stream.start_time is not None else 0
         fps = float(stream.average_rate or 25)
+        container.seek(int((times[0] + origin) / float(stream.time_base)), stream=stream, backward=True)
         for index, frame in enumerate(container.decode(stream)):
             time = float(frame.time) - origin if frame.time is not None else index / fps
             if position >= len(times):
@@ -204,8 +214,19 @@ def _extract_tracks(info, config, model, progress):
                           info.get("shot_times_sec"))
     tag_ensemble_tracks(tracks, samples)
     requests = defaultdict(list)
+    crop_cache = config.get('_crop_cache')
+    vectors_by_key = {}
+    selected_keys = defaultdict(list)
+    def crop_key(si, fi):
+        sample = samples[si]
+        face = sample['faces'][fi]
+        fields = ('face', 'face_keypoints', 'frontal_score', 'subject_kind', 'subject_box')
+        value = [sample['time_sec'], sample['frame_width'], sample['frame_height'],
+                 {k:face.get(k) for k in fields},
+                 [other.get('track_box', other.get('face')) for i,other in enumerate(sample['faces']) if i != fi]]
+        return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
     for track in tracks:
-        if track.get('character_group'):
+        if track.get('character_group') and not config.get('reference_images'):
             continue
         observations = track["observations"]
         # Spread representatives through the track, picking the clearest in each bucket.
@@ -214,7 +235,12 @@ def _extract_tracks(info, config, model, progress):
             si, fi = max(choices, key=lambda p: samples[p[0]]["faces"][p[1]].get("mouth_clarity", 0)
                          + samples[p[0]]["faces"][p[1]].get("frontal_score", 0)
                          + samples[p[0]]["faces"][p[1]].get("subject_clarity", 0))
-            requests[samples[si]["time_sec"]].append((track, si, fi))
+            key = crop_key(si, fi)
+            selected_keys[track['id']].append(key)
+            if crop_cache is not None and key in crop_cache:
+                vectors_by_key[key] = crop_cache[key]
+            else:
+                requests[samples[si]["time_sec"]].append((track, si, fi))
     if progress:
         progress(f"Character crops: {len(tracks)} shot-local tracks; {len(requests)} full-resolution frames")
     frames = _selected_source_frames(info["path"], sorted(requests))
@@ -225,14 +251,17 @@ def _extract_tracks(info, config, model, progress):
                 sample = samples[si]
                 vector = model.extract(frame, sample["faces"][fi], sample["frame_width"],
                                        sample["frame_height"], sample["faces"])
-                if vector is not None:
-                    track["vectors"].append(vector.tolist())
+                vectors_by_key[crop_key(si, fi)] = vector.tolist() if vector is not None else None
+                if crop_cache is not None:
+                    crop_cache[crop_key(si, fi)] = vector.tolist() if vector is not None else None
             count += 1
             if progress and count % 100 == 0:
                 progress(f"Character embeddings: {count}/{len(requests)} crop frames")
     finally:
         frames.close()
     for track in tracks:
+        track['vectors'] = [vectors_by_key[key] for key in selected_keys[track['id']]
+                            if vectors_by_key[key] is not None]
         track.pop("last_box", None)
         track.pop("last_time", None)
     return tracks
@@ -415,10 +444,21 @@ def rank_characters(tracks, config, threshold, appearance_samples=None):
 
 def _embedding_tracks(info, cache_dir, config, kind, progress):
     path = model_path(kind, config)
-    identity = {"source": info.get("cache_identity"), "model_sha256": fingerprint(path),
+    runtime = config.get('_runtime_cache')
+    stat = path.stat()
+    fingerprint_key = ('fingerprint', str(path), stat.st_size, stat.st_mtime_ns)
+    digest = runtime.get(fingerprint_key) if runtime is not None else None
+    if digest is None:
+        digest = fingerprint(path)
+        if runtime is not None:
+            runtime[fingerprint_key] = digest
+    identity = {"source": info.get("cache_identity"), "model_sha256": digest,
                 "source_kind": kind, "version": CHARACTER_VERSION,
                 "device": config["device"], "device_index": config["device_index"],
-                "max_track_gap_sec": config["max_track_gap_sec"], "embeddings_per_track": config["embeddings_per_track"]}
+                "max_track_gap_sec": config["max_track_gap_sec"], "embeddings_per_track": config["embeddings_per_track"],
+                'analyzed_seconds':info.get('analyzed_seconds',info['duration_sec']),
+                'sample_count':len(info['samples'])}
+    identity['extract_ensemble_features'] = bool(config.get('reference_images'))
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     cache = Path(cache_dir) / f"characters-{key}.json.gz"
     tracks = None
@@ -434,14 +474,31 @@ def _embedding_tracks(info, cache_dir, config, kind, progress):
         except (OSError, ValueError, EOFError, KeyError):
             pass
     if tracks is None:
-        model = EmbeddingModel(kind, config)
+        model_key = (kind, identity['model_sha256'], config['device'], config['device_index'])
+        model = runtime.get(model_key) if runtime is not None else None
+        if model is None:
+            model = EmbeddingModel(kind, config)
+            if runtime is not None:
+                runtime[model_key] = model
+        crop_identity = [info.get('path'), (info.get('cache_identity') or {}).get('size'),
+            (info.get('cache_identity') or {}).get('mtime_ns'), list(model_key), CHARACTER_VERSION]
+        crop_path = Path(cache_dir) / ('crops-' + hashlib.sha256(json.dumps(crop_identity).encode()).hexdigest() + '.json.gz')
+        crops = {}
+        if crop_path.is_file():
+            try:
+                crops = json.loads(gzip.decompress(crop_path.read_bytes()))
+            except (OSError, ValueError, EOFError):
+                pass
         if progress:
             progress(f"Character runtime: {getattr(model, 'execution', None)}")
-        tracks = _extract_tracks(info, config, model, progress)
+        tracks = _extract_tracks(info, {**config, '_crop_cache':crops}, model, progress)
         execution = getattr(model, "execution", None)
         if progress and execution and execution.get("fallback_reason"):
             progress(f"Character runtime: CPU fallback: {execution['fallback_reason']}")
         cache.parent.mkdir(parents=True, exist_ok=True)
+        crop_tmp = crop_path.with_suffix('.tmp')
+        crop_tmp.write_bytes(gzip.compress(json.dumps(crops).encode()))
+        crop_tmp.replace(crop_path)
         temporary = cache.with_suffix(".tmp")
         temporary.write_bytes(gzip.compress(json.dumps({"identity": identity, "tracks": tracks,
                                                        "execution": execution}).encode()))
@@ -449,8 +506,10 @@ def _embedding_tracks(info, cache_dir, config, kind, progress):
     return tracks,execution,identity,path
 
 
-def analyze_characters(video_info, cache_dir, config=None, progress=None):
+def analyze_characters(video_info, cache_dir, config=None, progress=None, runtime_cache=None):
     config = settings(config)
+    if runtime_cache is not None:
+        config['_runtime_cache'] = runtime_cache
     if not config["enabled"]:
         return video_info
     if "sample_fps" not in video_info or any("faces" not in s for s in video_info.get("samples", [])):
@@ -494,6 +553,8 @@ def analyze_characters(video_info, cache_dir, config=None, progress=None):
                 if progress:
                     progress('Character auto model: CCIP appearance features improve identity continuity '
                              f'({uncertain}/{len(trial_tracks)} -> {trial_uncertain}/{len(trial_tracks)} uncertain tracks).')
+    from autoedit.video.references import match_reference_tracks
+    reference_info = match_reference_tracks(tracks, kind, config, cache_dir, identity, progress)
     for track in tracks:
         cluster = by_track.get(track["id"])
         nested_associations = {tuple(entry['observation']):entry['previous_box']
@@ -511,6 +572,12 @@ def analyze_characters(video_info, cache_dir, config=None, progress=None):
                         character_status=(("main" if cluster["is_main"] else "supporting")
                                           if track.get("identity_confidence", 0) >= .5 else "unknown")
                                           if cluster else track["identity_status"])
+            if reference_info:
+                face.update(reference_match=track.get('reference_match', False),
+                            reference_confidence=track.get('reference_confidence', 0),
+                            reference_id=track.get('reference_id'),
+                            reference_template_id=track.get('reference_template_id'),
+                            reference_ambiguous=track.get('reference_ambiguous', False))
     _annotate_subjects(info, source_kind)
     info["character_analysis"] = {"version": CHARACTER_VERSION, "selection_policy":"exposure-ranked-cast",
         "model_sha256": identity["model_sha256"],
@@ -521,6 +588,8 @@ def analyze_characters(video_info, cache_dir, config=None, progress=None):
         "coverage_target": config["coverage_target"], "coverage_achieved": achieved,
         "min_main_fraction": config["min_main_fraction"], "clusters": clusters,
         "tracks": [{k: v for k, v in track.items() if k != "vectors"} for track in tracks]}
+    if reference_info:
+        info['character_analysis']['reference'] = reference_info
     if progress:
         progress(f"Characters: {len(clusters)} clusters, {sum(c['is_main'] for c in clusters)} main, "
                  f"coverage={achieved:.1%}; unknown tracks={sum(t['identity_status'] == 'unknown' for t in tracks)}")
@@ -546,7 +615,8 @@ def _annotate_subjects(info, kind):
         # Exposure rank precedes speech/size. The matcher also evaluates every
         # separate face track when strict speech needs another visible actor.
         def priority(face):
-            return ({'main':0,'supporting':1,'unknown':2,'noise':3}.get(face.get('character_status'),2),
+            return (not face.get('reference_match', False),
+                    {'main':0,'supporting':1,'unknown':2,'noise':3}.get(face.get('character_status'),2),
                     face.get('character_rank') or 1000000, not face.get('speaking'))
         best = min(map(priority, faces), default=None)
         candidates = [face for face in faces if priority(face) == best]
@@ -557,6 +627,7 @@ def _annotate_subjects(info, kind):
             sample["face_visible"] = float(bool(selected.get('face_detected')))
         else:
             sample.update(character_status="unknown", character_id=None, character_rank=None, identity_confidence=0)
+            sample.update(reference_match=False, reference_id=None, reference_confidence=0.)
             sample.update(face_detected=False, face_visible=0., mouth_clarity=0., closeup_score=0.)
     annotate_speaking(info["samples"], kind)
 
@@ -567,10 +638,16 @@ def cut_character_metrics(samples, start, end, sample_interval, min_main_fractio
     identities = defaultdict(float)
     rank_durations = defaultdict(float)
     confidence = 0.0
+    reference_durations = defaultdict(float)
+    reference_confidences = defaultdict(float)
     for index, sample in enumerate(samples):
         following = samples[index + 1]["time_sec"] if index + 1 < len(samples) else end
         weight = max(0, min(end, following, sample["time_sec"] + sample_interval) - max(start, sample["time_sec"]))
         state = sample.get("character_status", "unknown")
+        if sample.get('reference_match'):
+            reference_id = sample.get('reference_id') or 'reference-1'
+            reference_durations[reference_id] += weight
+            reference_confidences[reference_id] += weight * sample.get('reference_confidence', 0)
         durations[state] += weight
         if sample.get("character_id"):
             identities[sample["character_id"]] += weight
@@ -592,7 +669,14 @@ def cut_character_metrics(samples, start, end, sample_interval, min_main_fractio
         state = "uncertain"
     ranks = [s["character_rank"] for s in samples if s.get("character_rank") is not None
              and start <= s["time_sec"] < end]
+    primary_reference = max(reference_durations, key=reference_durations.get, default=None)
+    reference_fraction = reference_durations.get(primary_reference, 0.) / length
     return {"decision": state, "main_fraction": main, "supporting_fraction": supporting,
+            "reference_id": primary_reference if reference_fraction >= min_main_fraction else None,
+            "reference_fraction": reference_fraction,
+            "reference_any_fraction": sum(reference_durations.values()) / length,
+            "reference_fractions": {rid:seconds/length for rid,seconds in reference_durations.items()},
+            "reference_confidence": reference_confidences.get(primary_reference, 0.) / length,
             "unknown_fraction": unknown, "noise_fraction": noise,
             "character_ids": sorted(identities, key=lambda cid: (-identities[cid], cid)),
             "best_rank": min(ranks) if ranks else None, "identity_confidence": confidence / length,

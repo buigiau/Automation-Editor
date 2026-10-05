@@ -3,7 +3,8 @@ import math
 
 
 TIME_KEYS = {"time_sec", "start_sec", "end_sec", "in_sec", "out_sec", "start", "end",
-             "source_word_start_sec", "source_word_end_sec", "feature_anchor_sec"}
+             "source_word_start_sec", "source_word_end_sec", "feature_anchor_sec",
+             "visual_onset_sec", "suggested_cut_in_sec"}
 ID_KEYS = {"track_id", "character_id", "shot_id", "subject_track_id"}
 
 
@@ -55,11 +56,12 @@ def combine_video_infos(infos, gap):
         pool["source_spans"].append({"path": info["path"], "offset_sec": offset,
                                      "end_sec": offset + duration,
                                      "duration_sec": info["duration_sec"], "analyzed_seconds": duration})
-        pool["samples"].extend(shift_times(info.get("samples", []), offset, f"source-{index}"))
+        pool["samples"].extend(shift_times([s for s in info.get("samples", [])
+            if s['time_sec'] < duration], offset, f"source-{index}"))
         pool["segments"].extend(shift_times(
             bounded_segments(info.get("segments", []), duration), offset, f"source-{index}"))
         for field in ("transition_times_sec", "shot_times_sec"):
-            pool[field].extend(t + offset for t in info.get(field, []))
+            pool[field].extend(t + offset for t in info.get(field, []) if t <= duration)
         for backend, count in info.get("backend_counts", {}).items():
             pool["backend_counts"][backend] = pool["backend_counts"].get(backend, 0) + count
         offset += duration + separator
@@ -72,6 +74,22 @@ def combine_video_infos(infos, gap):
             "min_main_fraction": next(i["character_analysis"]["min_main_fraction"]
                                       for i in infos if i.get("character_analysis")),
             "sources": [i.get("character_analysis") for i in infos]}
+        references = [i['character_analysis']['reference'] for i in infos
+                      if (i.get('character_analysis') or {}).get('reference')]
+        if references:
+            from autoedit.video.references import pooled_reference_catalog
+            reference, owners = pooled_reference_catalog(references)
+            pool['character_analysis']['reference'] = reference
+            for sample in pool['samples']:
+                for subject in [sample, *sample.get('faces', [])]:
+                    tid = subject.get('reference_template_id')
+                    if subject.get('reference_match') and tid in owners:
+                        subject['reference_id'] = owners[tid]
+            for character in reference['characters']:
+                character['matched_tracks'] = sum(
+                    owners.get(track.get('reference_template_id'), track.get('reference_id')) == character['id']
+                    for info in infos for track in (info.get('character_analysis') or {}).get('tracks', [])
+                    if track.get('reference_match'))
     return pool
 
 
@@ -109,7 +127,8 @@ def localize_plan(plan, pool, video_only_sources):
         cut = local_cut(pool, {"in_sec": intro["in_sec"], "out_sec": intro["out_sec"]})
         intro.update(cut, video_only_source=video_only_sources[cut["source_video"]])
     plan["project"]["source_videos"] = [
-        {**span, "video_only_source": video_only_sources[span["path"]]} for span in pool["source_spans"]]
+        {**span, **({'video_only_source': video_only_sources[span['path']]}
+                   if span['path'] in video_only_sources else {})} for span in pool["source_spans"]]
     plan["video_analysis_meta"].update(
         duration_sec=sum(s["duration_sec"] for s in pool["source_spans"]),
         analyzed_seconds=sum(s["analyzed_seconds"] for s in pool["source_spans"]))

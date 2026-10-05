@@ -1,7 +1,7 @@
 """Decode once, select by timestamps, resize only selected frames."""
 
 def sampled_frames(path, sample_fps, max_seconds=0, width=640, transition_detector=None,
-                   between_samples=None):
+                   between_samples=None, start_sec=0):
     import av
 
     with av.open(str(path)) as container:
@@ -10,9 +10,15 @@ def sampled_frames(path, sample_fps, max_seconds=0, width=640, transition_detect
         stream.codec_context.thread_count = 4
         fps = float(stream.average_rate or 25)
         origin = float(stream.start_time * stream.time_base) if stream.start_time is not None else 0
-        next_time = 0.0
+        next_time = start_sec
+        if start_sec > 0:
+            container.seek(int((start_sec + origin) / float(stream.time_base)), stream=stream, backward=True)
         for index, frame in enumerate(container.decode(stream)):
+            if start_sec > 0 and frame.time is None:
+                raise RuntimeError('Cannot resume video without frame timestamps')
             time = (float(frame.time) - origin) if frame.time is not None else index / fps
+            if time + 1e-6 < start_sec:
+                continue
             if max_seconds > 0 and time >= max_seconds:
                 break
             if transition_detector is not None:

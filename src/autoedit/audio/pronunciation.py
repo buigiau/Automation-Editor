@@ -41,7 +41,7 @@ PHONETIC_LABELS = {
     "ghim": "G IH M", "sa": "S AA", "ca": "K AA", "ga": "G AA", "gaa": "G AA",
     "ba": "B AA", "ai": "AY", "aii": "AY", "em": "EH M", "iu": "Y UW",
     "quoạc": "K W AA K", "rô": "R OW", "tok": "T AO K", "đi": "D IY",
-    "đơm": "D ER M", "ắc": "AA K", "ết": "EH T", "ợ": "ER", "ựa": "AH",
+    "đơm": "D ER M", "ắc": "AA K", "ết": "EH T", "ựa": "AH",
     "ê": "EY", "hơ": "HH ER", "hớ": "HH ER", "ó": "AO", "ôi": "OY",
     "pii": "P IY", "ye": "Y EH", "yaayy": "Y EY", "whu": "HH UW",
     "woa": "W OW", "woa-nữ": "W OW", "huah": "HH W AA",
@@ -138,7 +138,7 @@ class VoiceIndex:
             # Old taxonomy aliases conflate some Vietnamese sounds with words.
             # Only actual English labels use lexical matching. For instance,
             # I -> ai must pass the pronunciation comparison, not an alias.
-            if item_stem(item) in ENGLISH_LABELS or sound.action != "SPEECH":
+            if sound.action == 'SPEECH' and item_stem(item) in ENGLISH_LABELS:
                 for word in spoken_words(item):
                     self.words.setdefault(transcript_token(word), []).append(item)
             if sound.action == "SPEECH":

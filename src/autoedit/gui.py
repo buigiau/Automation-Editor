@@ -39,9 +39,23 @@ def launch(config_path: str | None = None) -> int:
     kind_var = tk.StringVar(value=(cfg.get("video") or {}).get("source_kind") or "live_action")
     gap_var = tk.StringVar(value=str((cfg.get("video") or {}).get("source_gap_sec", 5.0)))
     lip_var = tk.BooleanVar(value=(cfg.get("video") or {}).get("require_lip_motion", False))
+    analysis_labels = {'Stop when all slots are verified': 'until_filled', 'Analyze all sources': 'full'}
+    analysis_var = tk.StringVar(value=next(label for label, mode in analysis_labels.items()
+        if mode == (cfg.get('video') or {}).get('analysis_mode', 'until_filled')))
     sampler_selection = (cfg.get("cubase") or {}).get("sampler_tracks") or ""
     sampler_var = tk.StringVar(value=", ".join(map(str, sampler_selection))
                               if isinstance(sampler_selection, list) else sampler_selection)
+    references = list(((cfg.get('video') or {}).get('characters') or {}).get('reference_images', []))
+    reference_var = tk.StringVar(value=f'{len(references)} images' if references else 'Automatic character selection')
+    def import_references():
+        paths = filedialog.askopenfilenames(title='Select character portraits or group images',
+            filetypes=[('Images', '*.png *.jpg *.jpeg *.webp *.bmp')])
+        if paths:
+            references[:] = paths
+            reference_var.set(f'{len(references)} images (characters detected on analysis)')
+    def clear_references():
+        references.clear()
+        reference_var.set('Automatic character selection')
 
     frm = ttk.Frame(root, padding=12)
     frm.pack(fill=tk.BOTH, expand=True)
@@ -57,6 +71,7 @@ def launch(config_path: str | None = None) -> int:
         ("Source Videos", None, None),
         ("Audio Folder", audio_var, lambda: _browse_dir(audio_var, "Select audio folder")),
         ("Output Folder", output_var, lambda: _browse_dir(output_var, "Select output folder")),
+        ('Target characters (optional)', reference_var, import_references),
     ]
     for i, (label, var, browse) in enumerate(rows):
         ttk.Label(frm, text=label).grid(row=i, column=0, sticky="w", pady=4, padx=(0, 8))
@@ -86,7 +101,13 @@ def launch(config_path: str | None = None) -> int:
             ttk.Button(video_buttons, text="Add videos…", command=add_videos).pack(fill=tk.X)
             ttk.Button(video_buttons, text="Remove selected", command=remove_videos).pack(fill=tk.X, pady=(4, 0))
             continue
-        ttk.Entry(frm, textvariable=var).grid(row=i, column=1, sticky="ew", pady=4)
+        ttk.Entry(frm, textvariable=var, state='readonly' if var is reference_var else 'normal').grid(row=i, column=1, sticky="ew", pady=4)
+        if var is reference_var:
+            buttons = ttk.Frame(frm)
+            buttons.grid(row=i, column=2, padx=(8, 0))
+            ttk.Button(buttons, text='Import images', command=import_references).pack(side=tk.LEFT)
+            ttk.Button(buttons, text='Clear', command=clear_references).pack(side=tk.LEFT)
+            continue
         ttk.Button(frm, text="Browse…", command=browse).grid(row=i, column=2, padx=(8, 0), pady=4)
 
     log = tk.Text(frm, height=12, wrap="word")
@@ -99,8 +120,11 @@ def launch(config_path: str | None = None) -> int:
     ttk.Label(frm, text="Blank = all; e.g. 2-13").grid(row=len(rows) + 2, column=2, padx=(8, 0))
     ttk.Checkbutton(frm, text="Require speaking mouths (off = clear character shots)",
                     variable=lip_var).grid(row=len(rows) + 3, column=1, columnspan=2, sticky="w")
-    log.grid(row=len(rows) + 4, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
-    frm.rowconfigure(len(rows) + 4, weight=1)
+    ttk.Label(frm, text='Analysis').grid(row=len(rows) + 4, column=0, sticky='w')
+    ttk.Combobox(frm, textvariable=analysis_var, values=list(analysis_labels), state='readonly').grid(
+        row=len(rows) + 4, column=1, columnspan=2, sticky='ew')
+    log.grid(row=len(rows) + 6, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
+    frm.rowconfigure(len(rows) + 6, weight=1)
 
     def write(msg: str) -> None:
         log.insert(tk.END, msg + "\n")
@@ -120,6 +144,9 @@ def launch(config_path: str | None = None) -> int:
 
     def do_validate() -> list[str]:
         errors = validate_inputs(**current_kwargs())
+        for path in references:
+            if not Path(path).is_file():
+                errors.append(f'Character reference missing: {path}')
         try:
             import math
             gap = float(gap_var.get())
@@ -153,8 +180,9 @@ def launch(config_path: str | None = None) -> int:
                      video=list(video_list.get(0, tk.END)), audio_dir=audio_var.get().strip(),
                      output_dir=output_var.get().strip() or None)
         cfg.setdefault("video", {}).update(source_kind=kind_var.get(), source_gap_sec=float(gap_var.get()),
-                                           require_lip_motion=lip_var.get())
+                                           require_lip_motion=lip_var.get(), analysis_mode=analysis_labels[analysis_var.get()])
         cfg["video"].setdefault("characters", {})["main_group"] = "auto"
+        cfg['video']['characters']['reference_images'] = list(references)
         cfg.setdefault("cubase", {})["sampler_tracks"] = sampler_var.get().strip()
 
         def worker() -> None:
@@ -189,7 +217,7 @@ def launch(config_path: str | None = None) -> int:
         threading.Thread(target=worker, daemon=True).start()
 
     btns = ttk.Frame(frm)
-    btns.grid(row=len(rows) + 3, column=0, columnspan=3, sticky="w", pady=8)
+    btns.grid(row=len(rows) + 5, column=0, columnspan=3, sticky="w", pady=8)
     validate_btn = ttk.Button(btns, text="Validate", command=do_validate)
     validate_btn.pack(side=tk.LEFT, padx=(0, 8))
     run_btn = ttk.Button(btns, text="Run", command=do_run)

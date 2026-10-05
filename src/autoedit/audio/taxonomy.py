@@ -80,7 +80,6 @@ NEUTRAL = {
     "đơm": Sound("ĐƠM", "EM", ("đơm",)),
     "ắc": Sound("ẮC", "A", ("ắc",)),
     "ết": Sound("ẾT", "E", ("ết",)),
-    "ợ": Sound("Ợ", "E", ("ợ",)),
     "ựa": Sound("ỰA", "EA", ("ựa",)),
     "ê": Sound("Ê", "E", ("ê",)),
     "hơ": Sound("HƠ", "E", ("hơ",)),
@@ -108,6 +107,7 @@ NEUTRAL = {
 }
 
 EMOTION = {
+    'ợ': Sound('BURP', '', action='BURP'),
     "cười": Sound("LAUGH", "A", action="LAUGH"),
     "cười trẻ con": Sound("LAUGH_KID", "A", action="LAUGH"),
     "cười đàn ông": Sound("LAUGH_MAN", "A", action="LAUGH"),
@@ -185,6 +185,21 @@ def item_group(item):
     stem = item.get("stem") or PureWindowsPath(item.get("path") or item.get("name") or "").stem
     row = lookup(stem)
     return row[0] if row else item.get("group")
+
+
+def item_phonetics(item):
+    """Current taxonomy overrides stale catalog metadata in every matching path."""
+    stem = item.get('stem') or PureWindowsPath(item.get('path') or item.get('name') or '').stem
+    row = lookup(stem)
+    if row:
+        sound = row[1]
+        return {**item.get('phonetics', {}), 'action': sound.action,
+                'visemes': list(sound.visemes), 'needs_review': sound.review}
+    return item.get('phonetics') or {'action': 'UNCLEAR', 'visemes': []}
+
+
+def sound_type(action):
+    return 'speech' if action == 'SPEECH' else 'effect' if action == 'NONVOCAL' else 'unknown' if action == 'UNCLEAR' else 'vocal-event'
 
 
 def transcript_token(text):

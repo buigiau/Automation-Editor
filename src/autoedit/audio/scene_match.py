@@ -4,7 +4,8 @@ import math
 
 from autoedit.match.matcher import same_family
 from autoedit.audio.selection import select_audio_for_source
-from autoedit.audio.taxonomy import TAXONOMY, item_group
+from autoedit.audio.taxonomy import TAXONOMY, item_group, item_phonetics, sound_type
+from autoedit.audio.onsets import AudioOnsetError, articulation_onsets, source_onset
 from autoedit.audio.pronunciation import VoiceIndex, source_sounds, valid_sound
 from autoedit.cubase.inspect import parse_sampler_tracks
 
@@ -23,14 +24,33 @@ def _active_bounds(item):
     return lo, hi
 
 
+def _cut_samples(video_info, video, padding=0.):
+    """Overlapping refinement windows must not mix actors or duplicate frames."""
+    selected_track = (video.get('selection_metrics') or {}).get('subject_track_id')
+    samples = {}
+    for sample in video_info.get('samples', []):
+        if not video['in_sec']-padding <= sample['time_sec'] < video['out_sec']+padding or not sample.get('clear_face'):
+            continue
+        boundary = sample.get('refinement_cut')
+        if boundary and (abs(boundary['in_sec']-video['in_sec']) > .001 or abs(boundary['out_sec']-video['out_sec']) > .001):
+            continue
+        if selected_track and sample.get('track_id') != selected_track:
+            continue
+        samples.setdefault(round(sample['time_sec'], 7), sample)
+    return sorted(samples.values(), key=lambda s: s['time_sec'])
+
+
 def _source_word_audio(candidates, video, video_info, used):
     start, end = video["in_sec"], video["out_sec"]
+    onset_slack = .25 if video_info.get('verify_onsets') else .001
     anchor = video.get("source_sound")
     if anchor:
-        if not valid_sound(anchor) or abs(anchor["start"]-start) > .001 or anchor["end"] > end:
+        if not valid_sound(anchor) or abs(anchor["start"]-start) > onset_slack or anchor["end"] > end:
             raise ValueError("Selected source sound no longer agrees with the cut onset; regenerate the plan.")
         sound = anchor
-        supported = anchor["matches"]
+        paths = {m['path'] for m in anchor['matches']}
+        # Saved anchors cannot bypass a corrected taxonomy or event/speech gate.
+        supported = [m for m in VoiceIndex(candidates).match(sound) if m['path'] in paths]
     else:
         # The first sound blocks all later words, even if it is unsupported or
         # uncertain. A cut through a word must not match the following word.
@@ -42,7 +62,7 @@ def _source_word_audio(candidates, video, video_info, used):
             return None
         sound = sounds[0]
         threshold = .75 if sound.get("action") else .6
-        if not start <= sound["start"] <= start+.25 or sound["end"] > end or sound["prob"] < threshold:
+        if not start-(.25 if video_info.get('verify_onsets') else 0) <= sound["start"] <= start+.25 or sound["end"] > end or sound["prob"] < threshold:
             return None
         supported = VoiceIndex(candidates).match(sound)
     matches = {m["path"]: m for m in supported}
@@ -65,8 +85,15 @@ def _source_word_audio(candidates, video, video_info, used):
             raise ValueError("WAV matched to the cut onset is missing from the Voice library; regenerate the plan.")
         return None
     score, fit, retained, item, word, lo, hi = max(ranked, key=lambda row: row[0])
+    phon = item_phonetics(item)
+    readable = [s for s in _cut_samples(video_info, video, .35)
+                if s['time_sec'] <= min(end, start+.6)]
+    onset = source_onset(readable, phon.get('visemes'), word['start'], video) if phon.get('action') == 'SPEECH' else None
+    verify = video_info.get('verify_onsets', False)
+    if verify and len(readable) >= 3 and phon.get('action') == 'SPEECH' and not onset:
+        raise AudioOnsetError('Source sound has no matching articulation onset; select another cut', video)
     chosen = dict(item, segment_start_sec=lo, segment_end_sec=min(hi, lo+end-word["start"]),
-                  placement_offset_sec=word["start"]-start)
+                  placement_offset_sec=max(0., word["start"]-start))
     match = matches[item["path"]]
     evidence = {"method": match["kind"], "score": round(score, 4),
                 "source_word": word.get("word"), "source_action": word.get("action"),
@@ -83,6 +110,13 @@ def _source_word_audio(candidates, video, video_info, used):
                 "alternatives": [{"name": row[3].get("name", row[3]["path"]),
                                   "source_word": row[4].get("word"), "score": round(row[0], 4)}
                                  for row in sorted(ranked, key=lambda row: -row[0])[:3]]}
+    evidence.update(sound_type=sound_type(phon.get('action', 'UNCLEAR')), onset_verified=False)
+    if onset:
+        evidence.update(onset, suggested_cut_in_sec=onset['visual_onset_sec'],
+                        onset_error_sec=onset['visual_onset_sec']-word['start'])
+        chosen['placement_offset_sec'] = max(0., onset['visual_onset_sec']-start)
+    else:
+        evidence.update(needs_review=True, timing_review='No measured articulation onset; source timestamp alone is not lip-sync verification')
     return chosen, evidence
 
 
@@ -94,8 +128,7 @@ def choose_audio(candidates, video, video_info, used, recent=()):
     """
     import numpy as np
 
-    samples = [s for s in video_info.get("samples", [])
-               if video["in_sec"] <= s["time_sec"] < video["out_sec"] and s.get("clear_face")]
+    samples = _cut_samples(video_info, video)
     strict = (video.get("selection_metrics") or {}).get("require_lip_motion")
     if strict:
         from autoedit.video.faces import lip_motion_evidence
@@ -110,13 +143,11 @@ def choose_audio(candidates, video, video_info, used, recent=()):
     if not strict and (not samples or (video.get("selection_metrics") or {}).get("tier", 1) >= 3):
         return _coarse_audio(candidates, video, video_info, used)
     duration = video["out_sec"] - video["in_sec"]
-    speaking = [s for s in samples if s.get("speaking")]
-    samples = speaking or samples
+    # Closed/preparatory and closing samples are essential negative evidence.
     times = np.array([s["time_sec"] - video["in_sec"] for s in samples])
     aperture = np.array([s.get("lip_aperture", s.get("openness", 0) / 2) for s in samples])
     opened = np.clip(aperture / max(float(np.quantile(aperture, .9)), .08), 0, 1)
     shapes = ["M" if a < .035 else _shape(s.get("category")) for a, s in zip(aperture, samples)]
-    expression = _shape(video.get("category"))
     ranking = []
     seen = set()
     for item in candidates:
@@ -125,11 +156,10 @@ def choose_audio(candidates, video, video_info, used, recent=()):
         if item["path"] in seen:
             continue
         seen.add(item["path"])
-        phon = item.get("phonetics", {})
+        phon = item_phonetics(item)
         action = phon.get("action", "SPEECH")
-        if action in {"NONVOCAL", "UNCLEAR"}:
-            continue
-        if action != "SPEECH" and not same_family(action, expression):
+        # Events require source-event evidence, never expression similarity.
+        if action != 'SPEECH':
             continue
         lo = float(item.get("active_start_sec", item.get("segment_start_sec", 0)) or 0)
         hi = float(item.get("active_end_sec", item.get("segment_end_sec", item.get("duration_sec", 0))) or 0)
@@ -139,9 +169,14 @@ def choose_audio(candidates, video, video_info, used, recent=()):
         visemes = phon.get("visemes") or [_shape(item.get("category"))]
         env = np.array(item.get("envelope") or [1., 1.])
         step = float(item.get("envelope_step_sec") or length)
-        # A negative onset trims an overlong recording; a positive onset adds
-        # only the local silence needed before the mouth starts moving.
+        # Legacy callers may shift/trim their preview. The verified pipeline
+        # moves the video cut instead, preserving the recording's initial sound.
         shifts = np.arange(-min(max(0, length-duration), .3), min(.3, max(0, duration-length)) + .001, .025)
+        onset_samples = _cut_samples(video_info, video, .35)
+        onsets = articulation_onsets(onset_samples, visemes, max(0, video['in_sec']-.25),
+                                    min(video['out_sec']-.05, video['in_sec']+.3))
+        if video_info.get('verify_onsets'):
+            shifts = np.array([p['visual_onset_sec']-video['in_sec'] for p in onsets])
         for shift in shifts:
             local = times - shift
             active = (local >= 0) & (local < length)
@@ -153,8 +188,13 @@ def choose_audio(candidates, video, video_info, used, recent=()):
             fit = min(length, duration) / max(length, duration)
             retained = max(0, min(duration, shift+length)-max(0, shift))/length
             score = 3*overlap + 2*rhythm + fit + .5*retained
+            if video_info.get('verify_onsets'):
+                score -= 4*abs(float(shift))
+            # Moving the cut preserves the recording's initial articulation.
             ranking.append((score, overlap, rhythm, fit, shift, lo, hi, item))
     if not ranking:
+        if video_info.get('verify_onsets'):
+            raise AudioOnsetError('No labelled speech recording has a compatible articulation onset', video)
         raise ValueError("No labelled speech samples match this scene; review the Voice library labels.")
     # Avoid cycling back to the same word via another filename (ai/aii).
     # Exact transcript matches above always retain priority over variety.
@@ -166,7 +206,7 @@ def choose_audio(candidates, video, video_info, used, recent=()):
         ranking = fresh
     ranking.sort(key=lambda r: (-(r[0] - .6*used[r[-1]["path"]]), r[-1]["path"]))
     score, overlap, rhythm, fit, shift, lo, hi, item = ranking[0]
-    chosen = dict(item, segment_start_sec=lo + max(0, -shift), segment_end_sec=hi,
+    chosen = dict(item, segment_start_sec=lo if video_info.get('verify_onsets') else lo + max(0, -shift), segment_end_sec=hi,
                   placement_offset_sec=max(0, float(shift)))
     alternatives = []
     for row in ranking:
@@ -175,12 +215,19 @@ def choose_audio(candidates, video, video_info, used, recent=()):
             alternatives.append({"name": name, "score": round(row[0], 4)})
         if len(alternatives) == 3:
             break
-    return chosen, {"score": round(score, 4), "shape_overlap": round(overlap, 4),
+    evidence = {"score": round(score, 4), "shape_overlap": round(overlap, 4),
         "rhythm_fit": round(rhythm, 4), "duration_fit": round(fit, 4),
         "onset_shift_sec": round(float(shift), 4), "lip_sample_count": len(samples),
         "method": "filename-visemes-and-dense-lip-rhythm", "phoneme_sync_verified": False,
         "needs_review": True, "review_reason": "No supported source word; visual fallback only",
         "reuse_count": used[item["path"]], "alternatives": alternatives}
+    evidence.update(sound_type='speech', onset_verified=False)
+    if video_info.get('verify_onsets'):
+        proof = next(p for p in articulation_onsets(_cut_samples(video_info, video, .35),
+            item_phonetics(item).get('visemes'), max(0, video['in_sec']-.25), video['in_sec']+.3)
+            if abs(p['visual_onset_sec']-video['in_sec']-float(shift)) < 1e-6)
+        evidence.update(proof, suggested_cut_in_sec=video['in_sec']+float(shift))
+    return chosen, evidence
 
 
 def _coarse_audio(candidates, video, video_info, used):
@@ -188,7 +235,7 @@ def _coarse_audio(candidates, video, video_info, used):
     duration = video["out_sec"] - video["in_sec"]
     ranked, seen = [], set()
     for item in candidates:
-        if item["path"] in seen or item_group(item) != "NEUTRAL":
+        if item["path"] in seen or item_group(item) != "NEUTRAL" or item_phonetics(item).get('action') != 'SPEECH':
             continue
         seen.add(item["path"])
         lo, hi = _active_bounds(item)
@@ -206,6 +253,7 @@ def _coarse_audio(candidates, video, video_info, used):
                   placement_offset_sec=0.0, audio_style="NEUTRAL")
     return chosen, {"score": round(-negative_score, 4), "duration_fit": round(fit, 4),
                     "method": "neutral-no-readable-viseme", "phoneme_sync_verified": False,
+                    'sound_type': 'speech', 'onset_verified': False,
                     "needs_review": True, "reuse_count": reuse}
 
 

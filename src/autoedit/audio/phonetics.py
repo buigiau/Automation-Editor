@@ -1,7 +1,7 @@
 """Filename phonetics and voice catalog derived from the curated taxonomy."""
 import csv
 from pathlib import Path
-from autoedit.audio.taxonomy import lookup
+from autoedit.audio.taxonomy import lookup, sound_type
 from autoedit.audio.pronunciation import item_pronunciations, ENGLISH_LABELS
 
 
@@ -9,6 +9,7 @@ def filename_phonetics(stem):
     row = lookup(stem)
     sound = row[1] if row else None
     return {"label": stem, "action": sound.action if sound else "UNCLEAR",
+            'sound_type': sound_type(sound.action if sound else 'UNCLEAR'),
             "visemes": list(sound.visemes) if sound else [],
             "pronunciations": [" ".join(p) for p in item_pronunciations({"stem": stem})],
             "pronunciation_source": "english-dictionary" if stem in ENGLISH_LABELS else "vietnamese-phonetic-filename",

@@ -186,6 +186,38 @@ def _chunks(windows, size=60.0, context=1.0):
             core = edge
 
 
+class IncrementalSpeech:
+    """Stable core windows; overlap supplies context but each word has one owner."""
+
+    def __init__(self, transcribe, chunk_sec=30):
+        self.transcribe = transcribe
+        self.chunk_sec = chunk_sec
+        self.parts = {}
+
+    def scan(self, path, end, cache_dir, **kwargs):
+        rows = []
+        start = 0.
+        while start < end - 1e-8:
+            edge = min(start + self.chunk_sec, end)
+            key = (path, start, edge)
+            if key not in self.parts:
+                self.parts[key] = self.transcribe(path, [(start, edge)], cache_dir, **kwargs)
+            rows.append((start, edge, self.parts[key]))
+            start = edge
+        result = {k: v for k, v in rows[0][2].items() if k not in ('words', 'events', 'cache_identity')}
+        for field in ('words', 'events'):
+            result[field] = sorted([item for lo, hi, part in rows for item in part.get(field, [])
+                if lo <= (item['start'] + item['end'])/2 < hi], key=lambda item: item['start'])
+        result['has_audio'] = any(part.get('has_audio') for _, _, part in rows)
+        result['analyzed_seconds'] = end
+        result['execution'] = rows[-1][2].get('execution')
+        result['executions'] = [{'range': [lo, hi], 'execution': part.get('execution')}
+                                for lo, hi, part in rows]
+        result['status'] = ('transcribed' if result['words'] else 'vocal-events' if result['events']
+                            else 'no-speech' if result['has_audio'] else 'no-audio')
+        return result
+
+
 def transcribe_source(path, ranges, cache_dir, model="small", language="en", progress=None,
                       device="auto", compute_type="auto", device_index=0):
     """Return absolute source word timestamps; silent sources have no words.

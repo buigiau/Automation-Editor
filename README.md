@@ -1,5 +1,117 @@
 # Automation-Editor
 
+## Optional character references and articulation checks
+
+In the GUI, use **Target characters (optional) > Import images** to choose
+portraits of different characters, alternate views, or a thumbnail with multiple
+characters; **Clear** restores automatic exposure ranking.
+The CLI accepts repeated `--character-reference actor-a.png --character-reference group.jpg`,
+or set `video.characters.reference_images` in YAML. Human references need a
+readable face. Each detected face in a group image gets its own identity template;
+strongly matching alternate views across images are merged conservatively, but
+co-visible faces remain separate. Unreadable detected regions are reported;
+an image with no usable identity fails validation. A cartoon image with no
+detected faces is treated as one cropped character, so use individual crops
+if the group detector misses faces. References and video use the same identity model and preprocessing.
+Multiple consistent track observations are required; one similar frame or a
+lookalike ensemble does not establish a reference match. Evidence must consistently
+match one target; switching between imported characters cannot qualify a track.
+
+With references, incremental analysis stops early only after enough verified
+reference-character cuts are available. Otherwise it searches every selected
+source up to `video.max_seconds` (zero means no limit) before enabling the
+exposure-ranked fallback. These cuts are labelled in
+`video.character_selection.reference_fallback`. Without references, the
+existing stop-when-filled behavior remains. Timeline order and slot durations
+stay as configured in the project.
+
+Among eligible reference cuts, selection prefers characters used fewer times,
+then less selected duration, before ordinary exposure/quality preferences.
+This increases variety without relaxing scene, mouth-motion or audio checks.
+Distribution is best effort: missing footage, short appearances, insufficient
+slots or failed articulation checks can leave a target unselected. Adding targets
+expands eligible footage, not the project's slot count. Analysis still stops once
+the project is filled; it does not scan further solely to give every target a cut.
+Per-cut `character_selection.reference_id` identifies the chosen target.
+`video_analysis_meta.character_reference_selection` and the log report selected
+counts/durations per target and fallback cuts. Multi-source pooling keeps imported
+identities shared, while ordinary video track IDs remain source-local.
+
+Current voice taxonomy overrides stale catalogs in every matching path.
+Laughter, coughs, groans and burps cannot enter ordinary speech/neutral fallback
+through a matching mouth shape. Vocal events need source-event evidence; the
+current detector does not detect burps, so normal source analysis never assigns
+them automatically. Unknown labels remain uncertain rather than generic speech.
+
+Selected readable mouths are refined with 350 ms context and original-frame
+measurements around the opening. Articulation checks distinguish opening,
+reshaping and closed-consonant release from preparation/closing. Cuts may move
+to the measured onset; full-window person/character evidence, gaps, boundaries
+and durations are then checked again. Visual fallback remains an estimate
+(`phoneme_sync_verified: false`); unreadable mouths require review. These local
+checks do not claim exact phoneme recognition. Cubase MIDI is preserved and
+`cubase_timing_verified` remains false until actual playback is checked; the
+Premiere preview does not simulate MIDI/FX.
+
+Reference matching can reduce wrong-character choices, but searching for a
+late character and stricter onset checks may increase runtime. Compare real
+video results and `performance.json` before claiming an accuracy or speed gain.
+
+## Stop when enough scenes are verified
+
+The default `video.analysis_mode: until_filled` analyzes the beginning of each
+source in 30-second increments, at the existing sample rate. After each increment
+it tries to fill every unique Premiere slot and any empty intro, then verifies
+the selected mouths and prepares the scene/sample mapping. It stops source
+analysis as soon as a complete allocation passes those checks. Repeated instances
+of a nested sequence do not require additional source cuts.
+
+Cast exposure is ranked within the footage analyzed so far. It does not claim
+to identify the most frequent character in the unseen remainder. In the GUI,
+choose **Stop when all slots are verified** or **Analyze all sources**. YAML can
+set `video.analysis_mode: full` for whole-source ranking; `video.analysis_chunk_sec`
+controls the interval (default 30). CLI accepts `--analysis-mode full` and
+`--analysis-chunk-sec 30` on `autoedit run`.
+
+The scanner retains face/pose/tracking and transition state between increments.
+One second of measured context protects their boundaries. Failed dense mouth
+checks exclude those cuts and continue searching. The slot lengths, source gaps,
+person/prop checks, transition rules and strict speaking-mouth policy still apply.
+If all selected sources or `video.max_seconds` are exhausted, the run fails rather
+than publishing an incomplete plan. Existing plans remain in place on failure;
+check `run.log` for the latest run status before applying a previous plan.
+
+Completed analysis checkpoints, per-frame object detections, per-crop embeddings,
+audio windows and individual dense cut checks are cached. A resumed analysis
+warms detector/tracker state over the last second, then processes new frames.
+The isolated object worker reuses weights and decoded frames between actor and
+context queries. It selects CPU/CUDA and a batch size using available VRAM,
+reduces the batch on memory errors and reports the actual runtime. CUDA weights
+are offloaded between object scans so character/Whisper models can use the GPU.
+Object `compute_type: float16` is opt-in pending real-video quality review;
+float32 remains the default. Changing GPU alone does not establish accuracy.
+
+`edit-plan.json` includes the analyzed ranges and stop reason. `performance.json`
+records total wall time and stage timings; `source_processing_inclusive` includes
+the allocation callbacks, so stage timings must not be summed. Video-only assets
+are created for used sources after verification, using stream copy of the original
+video; this final copy can still read the entire used file without analyzing it.
+
+For real-input comparisons on each target machine:
+
+```text
+python scripts/benchmark_pipeline.py --config config.yaml --device auto
+python scripts/benchmark_pipeline.py --config config.yaml --device cpu
+```
+
+Each invocation creates a fresh benchmark output directory. The first run of each
+mode uses a cold cache; the second reuses it. Timing includes interpreter/model
+startup and artifact preparation. The report records whether the run met the
+10-minute target. It does not measure Premiere/Cubase import or final rendering,
+and timings are not a recognition-quality evaluation. Review selected cuts and
+audio before enabling float16; full and early-stop runs may select different
+characters because they analyze different amounts of footage.
+
 ## Multiple source videos
 
 In the GUI, use **Add videos…** to select several files at once or add more

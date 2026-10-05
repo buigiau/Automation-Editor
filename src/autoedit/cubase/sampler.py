@@ -90,6 +90,8 @@ def render_sampler_bundle(plan, output_dir):
         cubase["sample_render_version"] = RENDER_VERSION
         cubase["timing_mode"] = "existing-midi-triggers"
         cubase["source_onset_applied_to_sampler"] = False
+        cubase['midi_lip_sync_verified'] = False
+        slot['audio_match']['cubase_timing_verified'] = False
         if placement > .02:
             slot["audio_match"]["needs_review"] = True
             slot["audio_match"]["timing_review"] = "Source word offset is preview-only; check MIDI trigger against the mouth."
