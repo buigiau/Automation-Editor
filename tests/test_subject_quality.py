@@ -220,19 +220,19 @@ def test_fast_review_keeps_ranked_characters_and_defers_dense_checks(job, monkey
     assert not plan['cubase_slots'][0]['audio_match']['onset_verified']
     assert plan['cubase_slots'][0]['audio_match']['method'] != 'filename-visemes-and-dense-lip-rhythm'
     assert not refined and speech and exports
-    assert speech[0][1] == [(max(0., cut['in_sec']-1), min(6., cut['out_sec']+1))]
+    assert speech[0][1] == [(0., 30.)]  # Audio precedes visual selection and uses stable core regions.
 
 
-def test_review_audio_ranges_use_source_local_times_and_skip_unused_source(job, monkeypatch):
+def test_review_audio_search_covers_all_sources_before_visual_selection(job, monkeypatch):
     import autoedit.pipeline as pipeline
     config, inspect, install, scanned, speech, exports, refined = job
     config['video'].update(verification_mode='review', analysis_mode='full', require_lip_motion=False)
     install([12])
     plan = pipeline.run_pipeline(config)['plan']
-    assert len(speech) == 1  # Selected cuts in one source; unused source has no ASR work.
+    assert len(speech) == 2  # Full mode must also search the source not ultimately selected.
     assert speech[0][0] == 'first.mp4'
     cut = plan['slots'][0]['video']
-    assert speech[0][1] == [(max(0., cut['in_sec']-1), min(12., cut['out_sec']+1))]
+    assert all(ranges == [(0., 30.)] for _, ranges in speech)
     assert not refined and plan['review_status'] == 'manual_review_required'
 
 

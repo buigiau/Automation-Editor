@@ -71,7 +71,7 @@ def test_stops_only_after_verified_allocation_and_skips_later_sources(job):
     install([2, 6, 10])
     result = run_pipeline(config)
     assert scanned == [('first.mp4', 2), ('first.mp4', 6)]
-    assert speech == [('first.mp4', [(0., 6)])]
+    assert speech == [('first.mp4', [(0., 30.)])]
     assert exports == ['first.mp4']
     assert len(result['plan']['slots']) == 1
     meta = result['plan']['video_analysis_meta']
@@ -81,7 +81,7 @@ def test_stops_only_after_verified_allocation_and_skips_later_sources(job):
     assert json.loads((Path(config['job']['output_dir'])/'performance.json').read_text())['status'] == 'completed'
 
 
-def test_missing_intro_continues_without_exporting_or_transcribing(job):
+def test_missing_intro_continues_without_exporting_and_reuses_audio_region(job):
     from autoedit.pipeline import run_pipeline
     config, inspect, install, scanned, speech, exports, refined = job
     inspect['intro_slot'] = {'id': 'intro', 'status': 'empty', 'start_sec': 0, 'end_sec': 1,
@@ -89,7 +89,7 @@ def test_missing_intro_continues_without_exporting_or_transcribing(job):
     install([4, 8, 12])
     result = run_pipeline(config)
     assert scanned == [('first.mp4', 4), ('first.mp4', 8)]
-    assert speech == [('first.mp4', [(0., 8)])]
+    assert speech == [('first.mp4', [(0., 30.)])]
     cut, intro = result['plan']['slots'][0]['video'], result['plan']['intro_fill']
     assert intro['out_sec'] <= cut['in_sec'] or cut['out_sec'] <= intro['in_sec']
 
@@ -134,7 +134,7 @@ def test_exhausted_sources_preserve_previous_plan(job):
     dest.write_text('previous plan')
     with pytest.raises(InsufficientFootageError):
         run_pipeline(config)
-    assert not speech and not exports
+    assert speech and not exports  # Source audio is intentionally scanned before allocation.
     assert dest.read_text() == 'previous plan'
 
 

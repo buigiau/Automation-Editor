@@ -10,6 +10,11 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 _cancel_file = ContextVar('autoedit_cancel_file', default=None)
+_selection_deadline = ContextVar('autoedit_selection_deadline', default=float('inf'))
+
+
+class SelectionTimeout(TimeoutError):
+    pass
 
 
 class JobCancelled(RuntimeError):
@@ -20,6 +25,17 @@ def check_cancelled():
     path = _cancel_file.get()
     if path and Path(path).exists():
         raise JobCancelled('Job cancelled; verified checkpoints are saved for the next run.')
+    if time.monotonic() >= _selection_deadline.get():
+        raise SelectionTimeout('Source audio/scene search budget exhausted; export uses completed evidence.')
+
+
+@contextmanager
+def selection_deadline(deadline):
+    token = _selection_deadline.set(min(deadline, _selection_deadline.get()))
+    try:
+        yield
+    finally:
+        _selection_deadline.reset(token)
 
 
 def cancellation_file():

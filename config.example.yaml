@@ -37,6 +37,7 @@ premiere:
   import_mixdown: true
 
 audio:
+  source_match_search_budget_sec: 300  # shared fast-search budget; export is separate
   directory: 'D:\Editor\Voice'
   glob: "*.wav"
   files: []

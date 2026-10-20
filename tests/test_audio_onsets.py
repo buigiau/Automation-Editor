@@ -47,7 +47,7 @@ def test_track_change_cannot_manufacture_an_opening():
     assert not articulation_onsets(samples, ['A'], 0,.3)
 
 
-def test_source_word_and_visual_fallback_both_require_articulation():
+def test_source_word_requires_articulation_but_neutral_fallback_is_explicit():
     item = {'path':'ai.wav','duration_sec':.3,'category':'AI', 'phonetics':filename_phonetics('ai')}
     cut = {'in_sec':0.,'out_sec':1.}
     info = {'verify_onsets':True, 'samples':motion([.3,.2,.1,0,0]),
@@ -55,8 +55,8 @@ def test_source_word_and_visual_fallback_both_require_articulation():
     with pytest.raises(AudioOnsetError):
         choose_audio([item], cut, info, Counter())
     info['source_speech'] = {}
-    with pytest.raises(AudioOnsetError):
-        choose_audio([item], cut, info, Counter())
+    _, evidence = choose_audio([item], cut, info, Counter())
+    assert not evidence['cut_onset_matched'] and evidence['needs_review']
 
 
 def test_source_word_onset_has_visual_evidence_and_preserves_wav_beginning():
@@ -64,7 +64,7 @@ def test_source_word_onset_has_visual_evidence_and_preserves_wav_beginning():
             'active_end_sec':.3,'phonetics':filename_phonetics('ai')}
     info = {'verify_onsets':True, 'samples':motion([0,0,.15,.2,.3]),
             'source_speech':{'words':[{'word':'I','start':.08,'end':.3,'prob':.95}]}}
-    selected, evidence = choose_audio([item], {'in_sec':0.,'out_sec':1.}, info, Counter())
+    selected, evidence = choose_audio([item], {'in_sec':.08,'out_sec':1.08}, info, Counter())
     assert evidence['onset_verified'] and evidence['suggested_cut_in_sec'] == pytest.approx(.1)
     assert selected['segment_start_sec'] == .02
     assert not evidence['phoneme_sync_verified']
@@ -111,9 +111,8 @@ def test_saved_speech_anchor_cannot_restore_a_reclassified_vocal_event():
         choose_audio(candidates,cut,{},Counter())
 
 
-def test_earlier_visual_onset_moves_the_cut_without_trimming_first_sound():
+def test_visual_onset_alone_cannot_authorize_a_non_neutral_vowel():
     voice = {'path':'a.wav','category':'A','duration_sec':.3,'active_start_sec':.02,'active_end_sec':.3}
     info = {'verify_onsets':True,'samples':motion([0,.2,.3,.15,.1,.05,0])}
-    selected, evidence = choose_audio([voice],{'in_sec':.1,'out_sec':.8},info,Counter())
-    assert evidence['suggested_cut_in_sec'] == pytest.approx(.05)
-    assert selected['segment_start_sec'] == .02
+    with pytest.raises(ValueError, match='NEUTRAL'):
+        choose_audio([voice],{'in_sec':.1,'out_sec':.8},info,Counter())

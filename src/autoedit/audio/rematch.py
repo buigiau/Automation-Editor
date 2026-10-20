@@ -13,6 +13,8 @@ def rematch_fixed_slots(plan, candidates, video_info):
     if not slots:
         raise ValueError("Existing scene-to-track assignments are required; no tracks will be created.")
     result = copy.deepcopy(plan)
+    from autoedit.audio.pronunciation import VoiceIndex
+    video_info = {**video_info, '_voice_index': VoiceIndex(candidates)}
     selected, used, recent = {}, Counter(), []
     for slot in result["cubase_slots"]:
         uid = slot["premiere"]["nested_sequence_uid"]

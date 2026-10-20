@@ -69,16 +69,17 @@ def test_filename_is_primary_and_24bit_envelope_trims_silence(tmp_path):
     assert len(info["envelope"]) == 20
 
 
-def test_dense_match_excludes_cough_and_moves_voice_onset():
+def test_dense_fallback_excludes_cough_and_does_not_invent_an_audio_onset():
     info = {"samples": [{"time_sec": t, "clear_face": 1, "category": "A", "lip_aperture": .2 if t >= .2 else 0}
                          for t in np.arange(0, 1, .05)]}
-    voice = {"path": "a.wav", "name": "a.wav", "category": "A", "duration_sec": .8,
+    voice = {"path": "hi.wav", "name": "hi.wav", "category": "HI", "duration_sec": .8,
              "phonetics": {"action": "SPEECH", "visemes": ["A"]},
              "envelope": [1]*40, "envelope_step_sec": .02}
     cough = {**voice, "path": "cough.wav", "phonetics": {"action": "COUGH", "visemes": ["A"]}}
     chosen, evidence = choose_audio([cough, voice], {"in_sec": 0, "out_sec": 1, "category": "A"}, info, Counter())
-    assert chosen["path"] == "a.wav"
-    assert chosen["placement_offset_sec"] == pytest.approx(.2, abs=.026)
+    assert chosen["path"] == "hi.wav"
+    assert chosen["placement_offset_sec"] == 0
+    assert not evidence['cut_onset_matched']
     assert not evidence["phoneme_sync_verified"]
 
 

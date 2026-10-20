@@ -23,6 +23,8 @@ from .native import NativeVisionClient
 from .local import LocalSelector, local_settings
 from .completion import complete_selection, shortage_policy, VERSION as COMPLETION_VERSION
 from .ollama import LocalAIError
+from autoedit.audio.matching import POLICY_VERSION, assign_rows, search_budget
+from autoedit.audio.search import SourceMatchSession
 
 
 class SelectionIncomplete(ValueError):
@@ -30,6 +32,7 @@ class SelectionIncomplete(ValueError):
 
 
 def preflight(config):
+    search_budget(config.get('audio', {}))
     shortage_policy(config.get('ai', {}))
     sampling_settings(config.get('ai', {}))
     backend = config.get('ai', {}).get('backend', 'gemini')
@@ -117,7 +120,9 @@ def run_ai_pipeline(config, log=None):
         return _run_ai_pipeline(config, log, resources)
     finally:
         for client in resources:
-            getattr(client, 'close', client.unload)()
+            close = getattr(client, 'close', None) or getattr(client, 'unload', None)
+            if close:
+                close()
 
 
 def _run_ai_pipeline(config, log=None, resources=None):
@@ -151,6 +156,9 @@ def _run_ai_pipeline(config, log=None, resources=None):
     sources = annotate_sources(sources, sampling)
     references = [{'id': f'reference-{i+1}', 'path': str(Path(p).resolve()), 'identity': identity(p)}
         for i, p in enumerate(config.get('video', {}).get('characters', {}).get('reference_images', []))]
+    source_session = SourceMatchSession(config, sources, voices, cache, log, started=job_started)
+    resources.append(source_session)
+    log('Shared source-first matching: opening words/pronunciations before visual candidates; neutral speech only for shortages.')
     backend = ai.get('backend', 'gemini')
     if backend not in ('gemini', 'local'):
         raise ValueError('ai.backend must be gemini or local')
@@ -163,6 +171,8 @@ def _run_ai_pipeline(config, log=None, resources=None):
         local_client = client_type(model, cache, log, url=ai.get('local_url', LOCAL_URL),
             timeout=float(ai.get('request_timeout_sec', 300)), **resource_settings(ai))
         resources.append(local_client)
+        local_client.job_deadline = source_session.deadline
+        local_client.finalization_deadline = source_session.deadline
         if options['mode'] == 'until_filled':
             local_client.target_deadline = job_started + options['target_seconds']
             log(f"Local search target: {options['target_seconds']:g}s; " +
@@ -172,7 +182,7 @@ def _run_ai_pipeline(config, log=None, resources=None):
             # A desired completion time is not permission to discard available
             # footage. Only an explicit maximum imposes a hard search deadline.
             if options['max_seconds']:
-                local_client.job_deadline = job_started + max(1., options['max_seconds']-30.)
+                local_client.job_deadline = min(source_session.deadline, job_started + max(1., options['max_seconds']-30.))
                 # Keep inference bounded, but let the last completed observation
                 # finish deterministic allocation before using the export reserve.
                 local_client.finalization_deadline = min(local_client.job_deadline+10.,
@@ -188,6 +198,7 @@ def _run_ai_pipeline(config, log=None, resources=None):
         log('Local visual analysis: CPU person/face screening when available, Qwen fallback; all Voice matches require audio review.')
     config['_ai_backend_identity'] = backend_identity if local_client else {'model': model}
     contract = {'prompt_version': PROMPT_VERSION, 'backend': backend, 'model': model, 'preset': ai.get('preset', 'custom'),
+        'source_match_policy': POLICY_VERSION, 'source_match_search_budget_sec': search_budget(config['audio']),
         'shortage_policy': policy, 'completion_version': COMPLETION_VERSION,
         'video_sampling': sampling,
         'sources': sources, 'references': references, 'source_gap_sec': gap,
@@ -195,19 +206,52 @@ def _run_ai_pipeline(config, log=None, resources=None):
         'template': {'premiere': identity(config['premiere']['project']), 'cubase': identity(config['cubase']['project']),
                      'sequence': inspect['template_sequence'], 'video_track_index': config['premiere']['video_track_index'],
                      'sampler_tracks': config['cubase'].get('sampler_tracks')},
-        'voices': [{k: v.get(k) for k in ('voice_id', 'name', 'duration_sec', 'category', 'phonetics', 'identity')} for v in voices]}
+        'voices': [{k: v.get(k) for k in ('voice_id', 'name', 'path', 'stem', 'duration_sec',
+                    'active_start_sec', 'active_end_sec', 'category', 'phonetics', 'identity')} for v in voices]}
     if local_client is not None:
         contract.update(backend_identity=backend_identity, local_analysis=local_settings(ai))
     key = digest(contract)
     record = cache / 'results' / (key + '.json')
     result = read(record)
+    if result is not None:
+        for source in sources:
+            saved = result.get('source_audio', {}).get(source['id'])
+            if saved:
+                source['source_speech'] = saved
     cache_hit = result is not None
     config['_ai_cache_hit'] = cache_hit
     timings.update(upload=0., ai=0.)
     parts, client = None, None
     local_selector = LocalSelector(local_client, cache, log) if local_client else None
+    if local_selector:
+        local_selector.source_session = source_session
+    audio_windows = iter(source_session.windows(contract)) if not local_selector else None
+    audio_candidates = []
+    uploads = None
+
+    def extend_audio_candidates():
+        if audio_windows is None:
+            return
+        onsets = {(c['source_id'], c['in_sec']) for c in audio_candidates}
+        target = len(onsets)+max(4, len(slots)*2)
+        while not source_session.expired and (source_session.full or len(onsets) < target):
+            try:
+                w = next(audio_windows)
+            except StopIteration:
+                break
+            slot = next(s for s in slots if s['id'] == w['sound_slot_id'])
+            anchor = w['source_sound']
+            paths = {m['path'] for m in anchor['matches']}
+            audio_candidates.append({'slot_id': slot['id'], 'source_id': w['source_id'],
+                'in_sec': anchor['start'], 'out_sec': anchor['start']+slot['required_duration_sec'],
+                'shot_start_sec': w['shot_start_sec'], 'shot_end_sec': w['shot_end_sec'],
+                'source_sound': anchor, 'voice_ids': [v['voice_id'] for v in voices if v['path'] in paths]})
+            onsets.add((w['source_id'], anchor['start']))
+
     def request_selection(previous=None, errors=None):
-        nonlocal parts, client
+        nonlocal parts, client, uploads
+        if source_session.expired:
+            raise TimeoutError('Source matching search budget exhausted')
         if startup_error:
             raise LocalAIError('Local model unavailable')
         if local_selector is not None:
@@ -219,15 +263,39 @@ def _run_ai_pipeline(config, log=None, resources=None):
         if client is None:
             client = GeminiClient(ai.get('api_key') or os.environ.get('GEMINI_API_KEY', ''), model, cache, log)
             client.request_timeout_sec = float(ai.get('request_timeout_sec', 300))
-            upload_started = time.perf_counter()
-            # Use original videos with sound; silent assets are for Premiere only.
-            parts = [{'text': PROMPT + '\nREQUIREMENTS:\n' + json.dumps(contract, ensure_ascii=False)}]
-            for item in sources + references:
+            client.deadline = source_session.deadline
+        extend_audio_candidates()
+        if not audio_candidates:
+            return previous or {'characters': [], 'selections': [], 'shortage_reason': 'No supported source opening sounds'}
+        source_session.release_for_vision()
+        if uploads is None:
+            uploads = {}
+        upload_started = time.perf_counter()
+        eligible = {c['source_id'] for c in audio_candidates}
+        for item in [s for s in sources if s['id'] in eligible] + references:
+            if item['id'] not in uploads:
                 uploaded = client.upload(item['path'], item['identity'])
-                if item in sources:
-                    uploaded = video_part(uploaded, item, sampling)
-                parts += [{'text': item['id']}, uploaded]
-            timings['upload'] = round(time.perf_counter() - upload_started, 3)
+                uploads[item['id']] = uploaded
+        timings['upload'] += round(time.perf_counter()-upload_started, 3)
+        media_parts = []
+        for source in sources:
+            ranges = sorted((max(source['analyzed_start_sec'], c['in_sec']-.2),
+                             min(source['analyzed_end_sec'], c['out_sec']+.2))
+                            for c in audio_candidates if c['source_id'] == source['id'])
+            merged = []
+            for lo, hi in ranges:
+                if merged and lo <= merged[-1][1]:
+                    merged[-1][1] = max(hi, merged[-1][1])
+                else:
+                    merged.append([lo, hi])
+            for lo, hi in merged:
+                media_parts += [{'text': f"{source['id']}: source window {lo:.3f}–{hi:.3f}s; return ABSOLUTE source seconds."},
+                    video_part(uploads[source['id']], {**source, 'analyzed_start_sec': lo, 'analyzed_end_sec': hi}, sampling)]
+        for reference in references:
+            media_parts += [{'text': reference['id']}, uploads[reference['id']]]
+        request_contract = {**contract, 'audio_candidates': audio_candidates,
+                            'source_audio_search': source_session.stats}
+        parts = [{'text': PROMPT + '\nREQUIREMENTS:\n' + json.dumps(request_contract, ensure_ascii=False)}] + media_parts
         request = parts
         if previous is not None:
             fallback_instruction = (' SHORTAGE FALLBACK AUTHORIZED: prioritize unused shots, but if still short, '
@@ -242,7 +310,27 @@ def _run_ai_pipeline(config, log=None, resources=None):
                 + json.dumps({'previous': previous, 'validation_errors': errors}, ensure_ascii=False)}]
         t = time.perf_counter()
         try:
-            return client.generate(request, SCHEMA)
+            response = client.generate(request, SCHEMA)
+            if not isinstance(response, dict):
+                return {'invalid_response': True, 'characters': [], 'selections': []}
+            if not isinstance(response.get('selections'), list):
+                response['selections'] = []
+            # The model may describe images, but cannot override source evidence.
+            for row in response.get('selections', []):
+                if not isinstance(row, dict):
+                    continue
+                start = row.get('in_sec')
+                if not isinstance(start, (int, float)) or isinstance(start, bool) or not math.isfinite(start):
+                    row['source_match_rejection'] = 'AI returned an invalid cut onset'
+                    continue
+                candidate = next((c for c in audio_candidates if c['slot_id'] == row.get('slot_id')
+                    and c['source_id'] == row.get('source_id') and abs(c['in_sec']-start) <= 1/30), None)
+                if candidate:
+                    row.update(in_sec=candidate['in_sec'], out_sec=candidate['out_sec'])
+                else:
+                    row['source_match_rejection'] = 'AI selected a cut outside the supplied opening-sound candidates'
+            assign_rows(response.get('selections', []), sources, voices)
+            return response
         finally:
             timings['ai'] = round(timings.get('ai', 0) + time.perf_counter() - t, 3)
     def ask(previous=None, errors=None):
@@ -259,7 +347,7 @@ def _run_ai_pipeline(config, log=None, resources=None):
             choices = [r for r in (previous, getattr(progressive, 'best', None)) if isinstance(r, dict)]
             partial = deepcopy(max(choices, key=lambda r: len(r.get('selections', []))) if choices else
                                {'characters': [], 'selections': []})
-            partial.setdefault('analysis_scope', {}).update(stop_reason='analysis_unavailable',
+            partial.setdefault('analysis_scope', {}).update(stop_reason='time_budget' if source_session.expired else 'analysis_unavailable',
                 error_type=type(exc).__name__)
             return partial
     log(f'AI 2/5: {len(slots)} unique fills, {len(inspect["scene_slots"])} scene runs; '
@@ -273,12 +361,14 @@ def _run_ai_pipeline(config, log=None, resources=None):
             and result.get('_autoedit_dedup_policy') == 'distinct_segments'):
         allow_same_shot = True
     best_rows, best_result = [], None
-    for attempt in range(2):
+    attempt = 0
+    while True:
         check_cancelled()
         if not isinstance(result, dict):
             result = {'invalid_response': True, 'selections': [], 'characters': []}
         result['_autoedit_dedup_policy'] = 'distinct_segments' if allow_same_shot else 'unique_shots'
-        log(f'AI 3/5: validating timestamps, shots and local frames (pass {attempt+1}/2)…')
+        assign_rows(result.get('selections', []), sources, voices)
+        log(f'AI 3/5: validating timestamps, shots and local frames (pass {attempt+1})…')
         rows, errors, ranking = validate_selection(result, slots, sources, voices, [r['id'] for r in references], gap,
             allow_same_shot=allow_same_shot, transition_tail_fallback_sec=sampling['transition_tail_fallback_sec'])
         started = time.perf_counter()
@@ -292,15 +382,17 @@ def _run_ai_pipeline(config, log=None, resources=None):
               'video_sampling':sampling,'deduplication_policy':result['_autoedit_dedup_policy'],
               'analysis_scope': result.get('analysis_scope', {}),
               'character_ranking': ranking, 'cache_hit': cache_hit, 'repair_count': attempt})
-        if not errors or attempt == 1:
+        if not errors or (attempt >= 1 and (local_selector is not None or source_session.expired
+                or source_session.stats['stop_reason'] in {'source_exhausted', 'time_budget'})):
             break
-        log('Requesting one repair for invalid/missing scenes…')
+        log('Repairing invalid/missing scenes with additional source-supported candidates…')
         # Persist a reviewable partial result before a repair API call can fail.
         save_review_snapshot(config, out, cache, inspect, inventory, slots, sources, voices, references, gap, result, rows, errors, key)
         if sampling['shot_fallback'] and len(rows) < len(slots):
             allow_same_shot = True
             log('Shortage fallback: permit distinct segments within the same shot; keep overlap, source gap and frame-duplicate checks.')
         result = ask(result, errors)
+        attempt += 1
     snapshot = save_review_snapshot(config, out, cache, inspect, inventory, slots, sources, voices, references, gap, result, rows, errors, key)
     if errors and policy == 'complete':
         selection_errors = deepcopy(errors)
@@ -308,7 +400,15 @@ def _run_ai_pipeline(config, log=None, resources=None):
             best_result['analysis_scope'] = deepcopy(result.get('analysis_scope', {}))
             rows, result = best_rows, best_result
         started = time.perf_counter()
-        result = complete_selection(result, rows, slots, sources, voices, references, gap, cache, log)
+        try:
+            result = complete_selection(result, rows, slots, sources, voices, references, gap, cache, log,
+                                        deadline=source_session.final_deadline)
+        except TimeoutError:
+            save_review_snapshot(config, out, cache, inspect, inventory, slots, sources, voices, references,
+                                 gap, result, rows, selection_errors, key)
+            raise SelectionIncomplete('Search budget exhausted before a decodable complete draft was available; '
+                                      'completed evidence is preserved in ai_review.html.') from None
+        assign_rows(result['selections'], sources, voices)
         result['selection_errors'] = selection_errors
         rows, errors, ranking = validate_selection(result, slots, sources, voices, [r['id'] for r in references], gap,
             allow_same_shot=allow_same_shot, transition_tail_fallback_sec=sampling['transition_tail_fallback_sec'],
@@ -333,13 +433,28 @@ def _run_ai_pipeline(config, log=None, resources=None):
             explanation += (f" Hard local time limit: {maximum:g}s; 30s reserved for validation/export."
                             if maximum else " The local search deadline was reached.")
             explanation += (" This does not establish that the source has too few usable scenes. "
-                            "To continue searching, increase Local hard maximum or set local_max_seconds=0 "
-                            "in Settings, then run again. Completed candidate observations remain cached.")
+                            "Increase audio.source_match_search_budget_sec for fast search, or choose full mode. "
+                            "A configured Local hard maximum also applies. Completed observations remain cached.")
         raise SelectionIncomplete(f"Only {len(rows)}/{len(slots)} valid distinct shots. See ai_review.html / ai-validation.json. "
                                   + '; '.join(f"{e['slot_id']}: {e['error']}" for e in errors[:5]) + explanation)
     # A draft is not cached as an AI-verified selection. Future runs may improve it.
+    result['source_audio'] = {s['id']: deepcopy(s['source_speech']) for s in sources}
+    if source_session.stats['stop_reason'] == 'searching':
+        source_session.stats['stop_reason'] = 'cached_selection' if cache_hit else 'enough_slots'
+    source_session.stats.update(matched_slots=sum(bool(r.get('audio_match', {}).get('cut_onset_matched')) for r in rows),
+        fallback_slots=sum(not r.get('audio_match', {}).get('cut_onset_matched') for r in rows),
+        selection_total_sec=round(monotonic()-job_started, 3))
+    result['source_audio_search'] = deepcopy(source_session.stats)
+    timings.update(source_audio=round(source_session.stats['asr_sec'], 3),
+                   source_audio_regions=source_session.stats['regions'],
+                   source_audio_cache_hits=source_session.stats['cache_hits'])
     if not result.get('completion'):
         write(record, result)
+    write(out/'ai-result.json', result)
+    write(out/'ai-review.json', snapshot)
+    write(out/'source_audio_search.json', source_session.stats)
+    write(out/'source_transcript.json', result['source_audio'])
+    source_session.close()
     return export_bundle(snapshot, out, rows, ranking, log, timings)
 
 
@@ -417,7 +532,7 @@ def export_bundle(snapshot, out, rows, ranking, log, timings=None):
                      segment_end_sec=voice.get('active_end_sec', voice['duration_sec']), placement_offset_sec=0.)
         sampler_slots.append({'id': scene['id'], 'index': scene['index'], 'audio': voice,
             'source_video': parent['source_video'], 'video': deepcopy(parent['video']),
-            'audio_match': {'method': row.get('visual_method', method) + '-voice', 'needs_review': True,
+            'audio_match': {**row.get('audio_match', {}), 'method': row.get('audio_match', {}).get('method', row.get('visual_method', method) + '-voice'), 'needs_review': True,
                 'audio_uncertain': row['audio_uncertain'], 'reference_fallback': row['reference_fallback'],
                 'reason': row['reason'], 'phoneme_sync_verified': False, 'cubase_timing_verified': False},
             'premiere': {'nested_sequence': scene['nested_sequence'], 'nested_sequence_uid': scene['nested_sequence_uid'],
@@ -441,6 +556,7 @@ def export_bundle(snapshot, out, rows, ranking, log, timings=None):
     if snapshot.get('review_provenance'):
         plan['ai_selection']['review_provenance'] = deepcopy(snapshot['review_provenance'])
     plan['audio'] = [s['audio'] for s in sampler_slots]
+    plan['source_audio_search'] = deepcopy(snapshot['result'].get('source_audio_search', {}))
     plan['video_analysis_meta'].update(quality_method=method + '-with-local-duplicate-check',
         needs_review=True, character_ranking_scope=snapshot['result'].get('analysis_scope', {}).get(
             'character_ranking_scope', 'supplied_sources'), cpu_threads=2)
@@ -501,6 +617,8 @@ def apply_review(config, log):
         if 'voice_id' in edit:
             row['voice_id'] = edit['voice_id']
         row['audio_uncertain'] = True
+        row.pop('source_match_rejection', None)
+    assign_rows(result['selections'], snapshot['sources'], snapshot['voices'], manual=True)
     rows, errors, ranking = validate_selection(result, snapshot['slots'], snapshot['sources'], snapshot['voices'],
         [r['id'] for r in snapshot['references']], snapshot['gap'],
         allow_same_shot=snapshot.get('deduplication_policy') == 'distinct_segments',
@@ -534,6 +652,7 @@ def recover_draft(review_path, output_dir, log=print):
         if identity(stamp['path']) != stamp:
             raise ValueError('Template changed; run selection again')
     sources, slots, voices = (snapshot[k] for k in ('sources', 'slots', 'voices'))
+    assign_rows(snapshot['result']['selections'], sources, voices)
     refs = [r['id'] for r in snapshot['references']]
     options = dict(allow_same_shot=snapshot.get('deduplication_policy') == 'distinct_segments',
                    transition_tail_fallback_sec=snapshot.get('video_sampling', {}).get('transition_tail_fallback_sec', 0))
@@ -542,7 +661,8 @@ def recover_draft(review_path, output_dir, log=print):
     rows, visual_errors = check_visual_duplicates(rows, sources, snapshot['cache'])
     errors += visual_errors
     result = complete_selection(snapshot['result'], rows, slots, sources, voices, snapshot['references'],
-                                snapshot['gap'], snapshot['cache'], log)
+                                snapshot['gap'], snapshot['cache'], log, deadline=monotonic()+300)
+    assign_rows(result['selections'], sources, voices)
     result['selection_errors'] = errors
     rows, errors, ranking = validate_selection(result, slots, sources, voices, refs, snapshot['gap'], **options, allow_completion=True)
     rows, visual_errors = check_visual_duplicates(rows, sources, snapshot['cache'])

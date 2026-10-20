@@ -113,6 +113,7 @@ def analyze_audio_dir(
     pattern: str = "*.wav",
     files: Iterable[str] | None = None,
     max_files: int = 0,
+    cache_dir: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     if files:
         paths = [Path(f) if Path(f).is_absolute() else Path(directory) / f for f in files]
@@ -120,4 +121,7 @@ def analyze_audio_dir(
         paths = iter_audio_files(directory, pattern)
     if max_files and max_files > 0:
         paths = paths[: max_files]
+    if cache_dir is not None:
+        from autoedit.ai.cache import cached_voice
+        return [cached_voice(p, cache_dir) for p in paths]
     return [analyze_file(p) for p in paths]

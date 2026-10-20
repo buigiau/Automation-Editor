@@ -17,7 +17,7 @@ def draft(monkeypatch, tmp_path):
     return dict(result={'characters': [], 'selections': [], 'analysis_scope': {'stop_reason': 'time_budget'}},
         accepted=[], slots=[{'id': f'slot-{i}', 'required_duration_sec': 1.} for i in range(14)],
         sources=[{'id': 's', 'path': 'not-used', 'duration_sec': 1800.}],
-        voices=[{'voice_id': 'v', 'duration_sec': 1}], references=[], gap=5., cache=tmp_path, log=lambda s: None)
+        voices=[{'voice_id': 'v', 'path': 'hi.wav', 'duration_sec': 1}], references=[], gap=5., cache=tmp_path, log=lambda s: None)
 
 
 def validate(result, args, allowed=True):

@@ -20,6 +20,7 @@ def defaults():
             'local_analysis_mode': 'until_filled', 'local_target_seconds': 300, 'local_max_seconds': 0,
             'video_fps': 1, 'max_source_seconds': 0, 'shot_fallback': True, 'transition_tail_fallback_sec': 0,
             'final_scene_transition_fallback': False, 'shortage_policy': 'complete',
+            'source_match_search_budget_sec': 300,
             'last_output': str(ROOT / 'output'), 'source_gap_sec': 5.0,
             'cache_dir': str(ROOT / 'output' / '.ai-cache')}
 
@@ -56,6 +57,7 @@ def apply_preset(config, settings, preset):
         template_sequence=pair['template_sequence'], video_track_index=int(pair['video_track_index']))
     cfg.setdefault('cubase', {}).update(project=pair['cubase_project'], sampler_tracks=pair['sampler_tracks'])
     cfg.setdefault('audio', {})['directory'] = settings['voice_directory']
+    cfg['audio']['source_match_search_budget_sec'] = settings.get('source_match_search_budget_sec', 300)
     cfg.setdefault('ai', {}).update(enabled=True, preset=preset, backend=settings.get('backend', 'gemini'), model=settings['model'],
         local_model=settings.get('local_model', 'qwen3-vl:2b-instruct'), local_url=settings.get('local_url', 'http://127.0.0.1:11435'),
         local_batch_frames=settings.get('local_batch_frames', 12),

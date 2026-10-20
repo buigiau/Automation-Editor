@@ -3,13 +3,18 @@
 Open `AutoEdit-CPU.cmd` or `AutoEdit-GPU.cmd`. Set up the three
 project pairs, Voice folder and API key once under **Thiết lập**. Select
 **Soda Pop / Golden / Cosita**, output folder and one or more source videos,
-optionally add character images, then **Chạy**. Each image has a thumbnail and
+optionally add character images, then **Thêm job**. Jobs run sequentially,
+and you can prepare the next job while one runs. Each has its own output subfolder.
+The desktop launchers load `config.yaml`. GPU and Local require `.venv-gpu`;
+the CPU launcher can also use `.venv`.
+Each image has a thumbnail and
 remove button. Removing all images restores automatic character selection.
 Images belong to this session; they are not restored from settings or legacy YAML.
 
 ## Qwen local (no API key)
 
-Open `AutoEdit-Local.cmd`, or select **Thiết lập → Cài / kiểm tra Qwen local**.
+Open `AutoEdit-Local.cmd` to check/install Qwen and activate the saved local model
+before the Studio opens, or select **Thiết lập → Cài / kiểm tra Qwen local**.
 The setup downloads the official portable Windows NVIDIA Ollama runtime and
 the saved local model (new default: `qwen3-vl:2b-instruct`). Downloads, runtime, model and server logs
 stay in `output/local-ai`; allow several GB of disk space. Installation requires

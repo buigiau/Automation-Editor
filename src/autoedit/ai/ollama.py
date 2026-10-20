@@ -122,10 +122,14 @@ class OllamaClient:
 
     def request(self, route, body=None, timeout=None):
         check_cancelled()
+        remaining = getattr(self, 'job_deadline', float('inf'))-time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('Source matching search budget exhausted')
+        timeout = min(timeout or self.timeout, remaining)
         payload = None if body is None else json.dumps(body).encode('utf-8')
         try:
             with self.opener.open(Request(self.url + route, data=payload,
-                    headers={'Content-Type': 'application/json'}), timeout=timeout or self.timeout) as response:
+                    headers={'Content-Type': 'application/json'}), timeout=timeout) as response:
                 return json.load(response)
         except HTTPError as exc:
             code = exc.code
@@ -159,7 +163,7 @@ class OllamaClient:
             subprocess.Popen([str(executable), 'serve'], env=environment, stdin=subprocess.DEVNULL,
                 stdout=output, stderr=output, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)
                 | getattr(subprocess, 'BELOW_NORMAL_PRIORITY_CLASS', 0))
-        deadline = time.monotonic() + 30
+        deadline = min(time.monotonic() + 30, getattr(self, 'job_deadline', float('inf')))
         while time.monotonic() < deadline:
             check_cancelled()
             try:

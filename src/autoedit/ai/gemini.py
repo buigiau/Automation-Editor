@@ -29,6 +29,10 @@ class GeminiClient:
 
     def request(self, url, body=None, headers=None, method=None, timeout=60):
         check_cancelled()
+        remaining = getattr(self, 'deadline', float('inf'))-time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('Source matching search budget exhausted')
+        timeout = min(timeout, remaining)
         parsed = urlparse(url)
         if parsed.scheme != 'https' or parsed.hostname != 'generativelanguage.googleapis.com':
             raise GeminiError('Unexpected Gemini endpoint')
@@ -46,6 +50,8 @@ class GeminiClient:
             exc.close()
             raise GeminiError(f'Gemini HTTP {code}; check API key, model, quota and file limits. No local fallback.') from None
         except (URLError, TimeoutError, OSError):
+            if time.monotonic() >= getattr(self, 'deadline', float('inf')):
+                raise TimeoutError('Source matching search budget exhausted') from None
             raise GeminiError('Gemini connection failed or timed out. Retry the job; no local fallback.') from None
         except ValueError:
             raise GeminiError('Gemini returned an invalid JSON response') from None
@@ -104,6 +110,8 @@ class GeminiClient:
             self.log(f'Gemini processing {path.name}…')
             for _ in range(10):
                 check_cancelled()
+                if time.monotonic() >= getattr(self, 'deadline', float('inf')):
+                    raise TimeoutError('Source matching search budget exhausted during upload processing')
                 time.sleep(.5)
             info, _ = self.request(BASE + '/v1beta/' + info['name'])
         return {'fileData': {'fileUri': info['uri'], 'mimeType': info.get('mimeType') or mimetypes.guess_type(path.name)[0]}}

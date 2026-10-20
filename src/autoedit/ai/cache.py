@@ -37,8 +37,7 @@ def write(path, value):
 
 
 def voice_catalog(config, cache):
-    from autoedit.audio.analyzer import analyze_file, iter_audio_files
-    from autoedit.cubase.sampler import inspect_sample
+    from autoedit.audio.analyzer import iter_audio_files
     paths = ([Path(config['directory']) / p for p in config['files']] if config.get('files')
              else iter_audio_files(config['directory'], config.get('glob', '*.wav')))
     if config.get('max_files', 0) > 0:
@@ -46,17 +45,23 @@ def voice_catalog(config, cache):
     result = []
     for path in paths:
         check_cancelled()
-        stamp = identity(path)
-        key = digest(['voice-v1', stamp])
-        dest = Path(cache) / 'voice' / (key + '.json')
-        item = read(dest)
-        if item is None:
-            inspect_sample(str(path))
-            item = analyze_file(path)
-            item['voice_id'] = 'voice-' + key[:20]
-            item['identity'] = stamp
-            write(dest, item)
-        result.append(item)
+        result.append(cached_voice(path, cache))
     if not result:
         raise ValueError('No usable WAV files in Voice library')
     return result
+
+
+def cached_voice(path, cache):
+    """Identical Voice records for standard, local and cloud workflows."""
+    from autoedit.audio.analyzer import analyze_file
+    from autoedit.cubase.sampler import inspect_sample
+    stamp = identity(path)
+    key = digest(['voice-v1', stamp])
+    dest = Path(cache)/'voice'/(key+'.json')
+    item = read(dest)
+    if item is None:
+        inspect_sample(str(path))
+        item = analyze_file(path)
+        item.update(voice_id='voice-'+key[:20], identity=stamp)
+        write(dest, item)
+    return item

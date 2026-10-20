@@ -49,6 +49,13 @@ for(const row of data.rows){
    : row.character_id.replace(/^person-([0-9]+)$/,'Nhân vật $1');
  el('h2',row.slot_id+' · '+identity,card);
  el('p',row.reason,card);
+ const match=row.audio_match||{};
+ const matchLabel=match.method==='source-audio-whisper-exact-word'?'Khớp từ nguồn':
+   match.method==='source-audio-pronunciation'?'Khớp phát âm nguồn':
+   match.method==='source-audio-event'?'Sự kiện âm nguồn · cần duyệt':'Âm dự phòng · cần duyệt';
+ el('p',matchLabel+(match.source_word?' · '+match.source_word:match.source_action?' · '+match.source_action:'')+
+   (typeof match.source_word_start_sec==='number'?' · nguồn '+match.source_word_start_sec.toFixed(3)+'s':'')+
+   (match.manual_override?' · đã sửa thủ công':''),card).className='flag';
  if(row.completion_fallback)el('p','Bản nháp dự phòng: '+row.fallback_relaxations.join(', '),card).className='flag';
  if(row.timeline_visible_prefix)el('p','Timeline chỉ phát '+(row.identity_end_sec-row.in_sec).toFixed(2)+' giây đầu; phần đuôi nest được điền đủ nhưng không xuất hiện trong bản dựng.',card).className='flag';
  el('p',(row.final_scene_transition_fallback?'Cục cuối timeline: cho phép chuyển cảnh · ':'')+(row.transition_tail_fallback_sec?'Fallback chuyển cảnh trong '+row.transition_tail_fallback_sec+' giây cuối · ':'')+(row.group_scene_fallback?'Fallback cảnh nhiều nhân vật · ':'')+(row.identity_sample_consistent===false?'Danh tính chưa xác định · ':'')+(row.same_shot_fallback?'Cùng shot, đoạn khác · ':'')+(row.reference_fallback?'Nhân vật thay thế · ':'')+(row.audio_uncertain?'Âm chưa chắc chắn':'Cần nghe xác nhận'),card).className='flag';

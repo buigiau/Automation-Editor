@@ -10,7 +10,7 @@ from autoedit.runtime import check_cancelled
 from .cache import digest, read, write
 from .ollama import LocalAIError, LocalOutputError
 
-VERSION = 'local-scenes-3'
+VERSION = 'local-scenes-4-source-first'
 SCAN_VERSION = 'local-scan-1'
 HINTS = ['speech', 'laugh', 'shout', 'surprise', 'neutral']
 OBSERVATION_SCHEMA = {'type': 'object', 'required': ['characters'], 'properties': {
@@ -320,16 +320,14 @@ def transition_safe(source, row, cache, *, tail_tolerance_sec=0):
 
 
 def choose_voice(voices, hint, duration, used):
-    terms = {'laugh': ('laugh', 'haha', 'hehe'), 'shout': ('scream', 'shout', 'aah', 'angry'),
-        'surprise': ('wow', 'oh', 'huh'), 'speech': ('speech', 'hello', 'hi', 'hey'), 'neutral': ()}[hint]
-    def score(voice):
-        text = ' '.join(str(voice.get(k, '')) for k in ('name', 'category', 'phonetics')).lower()
-        return (not any(term in text for term in terms), used.count(voice['voice_id']),
-                abs(float(voice['duration_sec'])-duration), voice['voice_id'])
-    return min(voices, key=score)
+    # Visual labels cannot authorize an event. All callers without an opening
+    # source sound, including completion/recovery, share the same safe pool.
+    from autoedit.audio.matching import choose_neutral
+    return choose_neutral(voices, duration, used)
 
 
-def allocate(contract, characters, runs, cache, *, allow_same_shot=False, previous=None, errors=None, verify=None, deadline=None):
+def allocate(contract, characters, runs, cache, *, allow_same_shot=False, previous=None, errors=None, verify=None, deadline=None,
+             _blocked=frozenset(), _search=True):
     from .visual import fingerprints, similar
     from .selection import used_end
     sources = {s['id']: s for s in contract['sources']}
@@ -340,6 +338,8 @@ def allocate(contract, characters, runs, cache, *, allow_same_shot=False, previo
     rejected = {e['slot_id'] for e in errors or []}
     old = {r['slot_id']: r for r in (previous or {}).get('selections', [])}
     selected, samples, used_voices = [], [], []
+    from autoedit.audio.matching import OpeningSoundIndex
+    opening_index = OpeningSoundIndex(contract['voices'])
     # Allocate long fills first, so small fills cannot consume the only long shot.
     def required_evidence(slot):
         return (min(1., slot['required_duration_sec']) if slot.get('allow_scene_changes') else
@@ -350,8 +350,11 @@ def allocate(contract, characters, runs, cache, *, allow_same_shot=False, previo
             break
         duration = slot['required_duration_sec']
         candidates = []
-        for run in sorted(runs, key=lambda r: (r.get('subject_count', 1) != 1,
+        for run in sorted(runs, key=lambda r: (not bool(r.get('source_sound')),
+                r.get('source_sound', {}).get('confidence_tier', 3), r.get('subject_count', 1) != 1,
                 rank.get(r['character_id'], 999), -r['mouth'], r['start_sec'])):
+            if run.get('sound_slot_id') and run['sound_slot_id'] != slot['id']:
+                continue
             if run.get('final_scene_transition_fallback') and (
                     not slot.get('allow_scene_changes') or run['fallback_slot_id'] != slot['id']):
                 continue
@@ -362,8 +365,9 @@ def allocate(contract, characters, runs, cache, *, allow_same_shot=False, previo
             lo, hi = run['start_sec']+.08, run['end_sec']-.08
             if hi-lo+1e-6 < duration:
                 continue
-            starts = [lo+(hi-lo-duration)/2, lo]
-            if allow_same_shot:
+            starts = ([run['source_sound']['start']] if run.get('source_sound')
+                      else [lo+(hi-lo-duration)/2, lo])
+            if allow_same_shot and not run.get('source_sound'):
                 starts += [lo+i*(duration+contract['source_gap_sec'])
                            for i in range(int((hi-lo)/(duration+contract['source_gap_sec']))+1)]
             for start in starts:
@@ -378,6 +382,8 @@ def allocate(contract, characters, runs, cache, *, allow_same_shot=False, previo
             if deadline is not None and time.monotonic() >= deadline:
                 break
             sid = candidate['source_id']
+            if (slot['id'], sid, round(candidate['in_sec'], 7)) in _blocked:
+                continue
             shot_id = str(candidate['shot']) if 'shot_id' in candidate else f"{sid}-shot-{candidate['shot']}"
             if any(r['source_id'] == sid and (
                     (not allow_same_shot and r['shot_id'] == shot_id)
@@ -400,13 +406,27 @@ def allocate(contract, characters, runs, cache, *, allow_same_shot=False, previo
                 continue
             if verify is not None and not verify(candidate):
                 continue
-            voice = choose_voice(contract['voices'], candidate['voice_hint'], duration, used_voices)
+            if candidate.get('source_sound'):
+                voice, evidence = opening_index.select(candidate, sources[sid].get('source_speech', {}),
+                                               used_voices, allow_saved=True)
+                if not evidence.get('cut_onset_matched'):
+                    continue
+            else:
+                from autoedit.audio.matching import fallback_evidence
+                voice = choose_voice(contract['voices'], candidate['voice_hint'], duration, used_voices)
+                evidence = fallback_evidence('Visual-only fallback; source opening did not match Voice')
             cid = candidate['character_id']
             row = {k: candidate[k] for k in ('source_id', 'in_sec', 'out_sec', 'shot_start_sec', 'shot_end_sec')}
             row.update(slot_id=slot['id'], shot_id=shot_id, duplicate_group='', character_id=cid,
                 voice_id=voice['voice_id'], reference_fallback=bool(contract['references']) and not bool(chars[cid]['reference_ids']),
                 audio_uncertain=True, reason=f"Qwen local visual estimate: {candidate['voice_hint']}; mouth score {candidate['mouth']}/3. "
                 'Voice chosen from catalog metadata; source audio was not analyzed. Review playback and sync.')
+            row['audio_match'] = evidence
+            if candidate.get('source_sound'):
+                row.update(source_sound=deepcopy(candidate['source_sound']),
+                           visual_action=candidate.get('visual_action'))
+                row['reason'] = ('Opening source sound '+str(evidence.get('source_word') or evidence.get('source_action'))
+                                 +' matched Voice; sampled character evidence requires playback review.')
             if tail:
                 row.update(transition_tail_fallback_sec=tail, subject_count_scope='stable_prefix')
             if final_fallback:
@@ -448,9 +468,29 @@ def allocate(contract, characters, runs, cache, *, allow_same_shot=False, previo
             break
     order = {slot['id']: i for i, slot in enumerate(contract['slots'])}
     selected.sort(key=lambda r: order[r['slot_id']])
-    return {'characters': deepcopy(characters), 'selections': selected,
+    result = {'characters': deepcopy(characters), 'selections': selected,
         'shortage_reason': '' if len(selected) == len(contract['slots']) else
             f'Local visual evidence supports only {len(selected)}/{len(contract["slots"])} non-duplicate fills.'}
+    # Only a failed greedy allocation needs reassignment. This searches cached
+    # candidate checks, never repeats Qwen inference, and has a short CPU budget.
+    if _search and len(selected) < len(contract['slots']) and any(r.get('source_sound') for r in runs):
+        until = min(deadline or float('inf'), time.monotonic()+.5)
+        pending, visited = [(result, _blocked)], set()
+        while pending and len(visited) < 128 and time.monotonic() < until:
+            partial, blocked = pending.pop()
+            for row in partial['selections']:
+                ban = blocked | {(row['slot_id'], row['source_id'], round(row['in_sec'], 7))}
+                if ban in visited:
+                    continue
+                visited.add(ban)
+                alternative = allocate(contract, characters, runs, cache, allow_same_shot=allow_same_shot,
+                    errors=errors, verify=verify, deadline=until, _blocked=ban, _search=False)
+                if len(alternative['selections']) > len(result['selections']):
+                    result = alternative
+                if len(result['selections']) == len(contract['slots']):
+                    return result
+                pending.append((alternative, ban))
+    return result
 
 
 class LocalSelector:
@@ -502,10 +542,11 @@ class LocalSelector:
         return result['same_character'] and result['clear_view']
 
     def select(self, contract, previous=None, errors=None, allow_same_shot=False):
-        if contract['local_analysis'].get('mode') == 'until_filled':
+        if getattr(self, 'source_session', None) is not None or contract['local_analysis'].get('mode') == 'until_filled':
             from .discovery import ProgressiveSelector
             if self.progressive is None:
                 self.progressive = ProgressiveSelector(self.client, self.cache, self.log)
+                self.progressive.source_session = getattr(self, 'source_session', None)
             return self.progressive.select(contract, previous, errors, allow_same_shot)
         if self.analysis is None:
             self.client.check_resources()

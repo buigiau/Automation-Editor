@@ -11,7 +11,7 @@ from pathlib import Path
 from autoedit.runtime import check_cancelled
 from .selection import number, used_end
 
-VERSION = 'draft-completion-1'
+VERSION = 'draft-completion-2-neutral-speech'
 RELAXATIONS = {'character_unverified', 'scene_changes', 'source_gap',
                'visual_duplicate', 'overlap', 'low_detail', 'freeze_frame'}
 
@@ -127,7 +127,13 @@ def _freeze_source(sources, duration, cache, log):
     raise ValueError('Cannot decode any source frame to complete the draft')
 
 
-def complete_selection(result, accepted, slots, sources, voices, references, gap, cache, log):
+def complete_selection(result, accepted, slots, sources, voices, references, gap, cache, log, *, deadline=float('inf')):
+    from autoedit.runtime import selection_deadline
+    with selection_deadline(deadline):
+        return _complete_selection(result, accepted, slots, sources, voices, references, gap, cache, log)
+
+
+def _complete_selection(result, accepted, slots, sources, voices, references, gap, cache, log):
     from .local import choose_voice, transition_safe
     from .visual import fingerprints, similar
     result = deepcopy(result)
@@ -193,6 +199,8 @@ def complete_selection(result, accepted, slots, sources, voices, references, gap
                                fallback_relaxations=sorted(set(flags)),
                                reason='Draft completion after AI shortage. Character and Voice match unverified. '
                                       'Review: '+', '.join(sorted(set(flags)))+'.')
+                    from autoedit.audio.matching import fallback_evidence
+                    row['audio_match'] = fallback_evidence('Draft completion after source-matched candidates were insufficient')
                     chosen = row, frames
                     break
                 if chosen:

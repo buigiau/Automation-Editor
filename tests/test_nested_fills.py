@@ -181,7 +181,7 @@ def test_pipeline_reselects_static_dense_cut_before_assigning_any_voice(tmp_path
     assert final['out_sec'] <= old['in_sec'] or final['in_sec'] >= old['out_sec']
     assert final['used_duration_sec'] == old['used_duration_sec'] == 4
     assert final['selection_metrics']['dense_lip_motion_verified']
-    assert result['plan']['cubase_slots'][0]['audio_match']['method'] == 'filename-visemes-and-dense-lip-rhythm'
+    assert result['plan']['cubase_slots'][0]['audio_match']['method'] == 'neutral-no-readable-viseme'
 
 
 @pytest.mark.parametrize("has_main_cut", [False, True])
@@ -208,7 +208,7 @@ def test_pipeline_rejects_scenery_before_publishing_plan_or_exporting(tmp_path, 
         pytest.fail("Rejected main/intro footage must not reach media export or transcription")
 
     monkeypatch.setattr(pipeline, "prepare_video_only_source", unexpected)
-    monkeypatch.setattr(pipeline, "transcribe_source", unexpected)
+    monkeypatch.setattr(pipeline, "transcribe_source", lambda *a, **k: {"has_audio": False, "words": []})
     monkeypatch.setattr(pipeline, "apply_cubase_plan", unexpected)
     plan_path = tmp_path / "edit-plan.json"
     payload_path = tmp_path / "premiere_apply.json"

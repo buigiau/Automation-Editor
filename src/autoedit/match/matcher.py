@@ -556,6 +556,8 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
             (0 if row[3].get('character_selection', {}).get('reference_fraction', 0)
                   >= (video_info.get('character_analysis') or {}).get('min_main_fraction', .85) else 1)
             if (video_info.get('character_analysis') or {}).get('reference') else 0,
+            sound_by_start[row[1]].get("confidence_tier", 1)
+            if row[1] in sound_by_start and sound_by_start[row[1]]["end"] <= row[1]+need else 3,
             reference_usage(row, reference_counts, reference_seconds),
             # A recognized primary view with uncertain identity still precedes
             # a known secondary actor; its uncertainty stays visible for review.
@@ -563,8 +565,6 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
             composition_usage(row, composition_counts),
             {"main": 0, "supporting": 1, "uncertain": 2}.get(
                 row[3].get("character_selection", {}).get("decision"), 0),
-            sound_by_start[row[1]].get("confidence_tier", 1)
-            if row[1] in sound_by_start and sound_by_start[row[1]]["end"] <= row[1]+need else 3,
             row[3]["transition_count"], row[3]["tier"] if require_speaking else max(2, row[3]["tier"]),
             # Preserve moving-mouth footage for voiced scenes when filling an
             # explicitly unvoiced opening.

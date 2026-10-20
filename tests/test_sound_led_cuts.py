@@ -112,6 +112,7 @@ def test_cough_event_matches_cough_recording_and_never_the_spoken_word_cough():
     event = {"action": "COUGH", "start": 2.13, "end": 2.7, "prob": .75}
     video = video_with({"words": [], "events": [event]}, pool)
     cut = match_slots_to_video([{"id": "scene", "required_duration_sec": 2}], [], video)[0]["video"]
+    cut['visual_action'] = 'COUGH'
     chosen, evidence = choose_audio(pool, cut, video, Counter())
     assert chosen["path"] == "ho khụ khụ.wav"
     assert evidence["method"] == "source-audio-event" and evidence["needs_review"]

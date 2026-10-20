@@ -10,7 +10,7 @@ from .local import allocate
 from .ollama import LocalAIError
 from .selection import used_end
 
-VERSION = 'candidate-first-30-ambiguous-cpu-vision'
+VERSION = 'candidate-first-31-source-audio'
 
 
 def evidence_duration(slot):
@@ -301,6 +301,13 @@ class ProgressiveSelector:
         self.vision_windows = []
         self.vision_phase = self.vision_done = False
         self.allocated_run_counts = {}
+        self.audio_deferred = {}
+        self.audio_reassign = False
+
+    def defer_audio(self, window):
+        if getattr(self, 'source_session', None) and not self.audio_reassign and window.get('source_sound'):
+            key = (window['source_id'], window['sound_slot_id'], window['source_sound']['start'])
+            self.audio_deferred[key] = window
 
     def needed_duration(self, contract):
         kept = {r['slot_id'] for r in (self.best or {}).get('selections', [])}
@@ -309,6 +316,11 @@ class ProgressiveSelector:
         return max(lengths, default=0.) if long_first else min(lengths, default=0.)
 
     def source_streams(self, contract, quick):
+        if getattr(self, 'source_session', None) is not None:
+            if getattr(self, '_audio_stream_started', False):
+                return []
+            self._audio_stream_started = True
+            return [iter(self.source_session.windows(contract))]
         return [distributed_candidates(s, contract['video_sampling']['video_fps'], self.longest,
             self.cache, self.deadline, self.log, minimum=self.minimum,
             source_gap=contract['source_gap_sec'], needed_duration=lambda: self.needed_duration(contract),
@@ -361,6 +373,8 @@ class ProgressiveSelector:
             characters = [c for c in characters if c['id'] in targeted]
             eligible_runs = [r for r in eligible_runs if r['character_id'] in targeted]
         prior = deepcopy(previous or self.best)
+        if getattr(self, 'source_session', None) and (self.source_session.full or self.audio_reassign):
+            prior = None
         if prior and not self.group_phase:
             prior['selections'] = [r for r in prior['selections'] if r.get('subject_count', 1) == 1]
         result = allocate(contract, characters, eligible_runs, self.cache, previous=prior, errors=errors,
@@ -393,7 +407,10 @@ class ProgressiveSelector:
                     row['reason'] += f" Appearance agreed at {row['character_sample_frames']} sampled cut frames; inspect full playback."
             else:
                 row['reason'] += ' Character identity inferred from candidate thumbnail; inspect the full cut.'
-        if self.best is None or len(result['selections']) > len(self.best['selections']):
+        def quality(value):
+            rows = value['selections']
+            return (len(rows), sum(r.get('audio_match', {}).get('word_probability', 0) for r in rows))
+        if self.best is None or quality(result) > quality(self.best):
             self.best = deepcopy(result)
         return result
 
@@ -405,6 +422,8 @@ class ProgressiveSelector:
             maximum = contract['local_analysis'].get('max_seconds', 0)
             self.deadline = min(time.monotonic()+maximum if maximum else float('inf'),
                 getattr(self.client, 'job_deadline', float('inf')))
+            if getattr(self, 'source_session', None) is not None:
+                self.deadline = min(self.deadline, self.source_session.deadline)
             self.allocation_deadline = min(time.monotonic()+maximum if maximum else float('inf'),
                 getattr(self.client, 'finalization_deadline', self.deadline))
             self.target_deadline = getattr(self.client, 'target_deadline', time.monotonic()+budget)
@@ -441,6 +460,11 @@ class ProgressiveSelector:
         size = 1 if getattr(self.client, 'single_image', False) else min(6, len(contract['slots']))
         while True:
             check_cancelled()
+            if (not self.streams and self.audio_deferred and not self.audio_reassign
+                    and time.monotonic() < self.deadline):
+                self.audio_reassign = True
+                self.streams = [iter(self.audio_deferred.values())]
+                self.log('Reassigning deferred source onsets before using neutral fallback; no ASR rescan.')
             self.timed_group_fallback()
             needed = self.needed_duration(contract)
             if contract['references'] and needed < self.reference_stage_duration-1e-6:
@@ -470,11 +494,12 @@ class ProgressiveSelector:
                 self.target_logged = True
             if self.runs:
                 result = self.result(contract, previous, errors, allow_same_shot)
-                if len(result['selections']) == len(contract['slots']):
+                if len(result['selections']) == len(contract['slots']) and not (
+                        getattr(self, 'source_session', None) and self.source_session.full):
                     self.log(f"Enough footage: {len(result['selections'])}/{len(contract['slots'])}; stopping source search.")
                     return result
                 needed = self.needed_duration(contract)
-                if contract['references'] and needed < self.reference_stage_duration-1e-6:
+                if contract['references'] and needed < self.reference_stage_duration-1e-6 and not getattr(self, 'source_session', None):
                     # Revisit cached regions after filling the scarce long cuts;
                     # their skipped short windows remain useful for later slots.
                     self.reference_stage_duration = needed
@@ -485,7 +510,8 @@ class ProgressiveSelector:
                     fallback = self.result(contract, previous, errors, True)
                     if len(fallback['selections']) > len(result['selections']):
                         self.log(f"Validated distinct segments with shortage fallback: {len(fallback['selections'])}/{len(contract['slots'])}.")
-                    if len(fallback['selections']) == len(contract['slots']):
+                    if len(fallback['selections']) == len(contract['slots']) and not (
+                            getattr(self, 'source_session', None) and self.source_session.full):
                         self.log('Enough distinct segments with same-shot shortage fallback; stopping source search.')
                         return fallback
             if time.monotonic() >= self.deadline or not self.streams:
@@ -493,7 +519,8 @@ class ProgressiveSelector:
             batch = []
             from .local import transition_safe
             from .visual import fingerprints, similar
-            kept = (self.best or {}).get('selections', [])
+            kept = ([] if getattr(self, 'source_session', None) and (self.source_session.full or self.audio_reassign)
+                    else (self.best or {}).get('selections', []))
             missing = [s for s in sorted(contract['slots'], key=lambda s: (-evidence_duration(s), -s['required_duration_sec']))
                        if s['id'] not in {r['slot_id'] for r in kept}]
             available_slots = list(missing)
@@ -532,8 +559,10 @@ class ProgressiveSelector:
                     continue
                 # Reject unusable footage before paying for vision inference.
                 slot = next((s for s in available_slots if
+                    (not window.get('sound_slot_id') or window['sound_slot_id'] == s['id']) and
                     window['end_sec']-window['start_sec'] >= evidence_duration(s)+.16-.000001), None)
                 if slot is None:
+                    self.defer_audio(window)
                     continue
                 duration = slot['required_duration_sec']
                 evidence_length = evidence_duration(slot)
@@ -543,6 +572,8 @@ class ProgressiveSelector:
                 lo, hi = window['start_sec']+.08, window['end_sec']-evidence_length-.08
                 starts = dict.fromkeys(round(max(lo, min(hi, t)), 9) for t in
                                        (center, center-.3, center+.3, lo, hi))
+                if window.get('source_sound'):
+                    starts = [window['source_sound']['start']]
                 chosen = None
                 for a in starts:
                     row = {**window, 'in_sec': a, 'out_sec': a+duration}
@@ -553,6 +584,7 @@ class ProgressiveSelector:
                     if any(r['source_id'] == sid and not (
                         a >= used_end(r)+contract['source_gap_sec']-.000001 or
                         used_end(row) <= r['in_sec']-contract['source_gap_sec']+.000001) for r in occupied):
+                        self.defer_audio(window)
                         continue
                     tail = 0
                     if final_fallback or visible_prefix:
@@ -592,13 +624,15 @@ class ProgressiveSelector:
                     continue
                 return self.result(contract, previous, errors, allow_same_shot)
             self.log(f"Classifying {len(batch)} candidate scenes at {batch[0]['start_sec']:.2f}s; searched {self.searched}")
+            if getattr(self, 'source_session', None):
+                self.source_session.release_for_vision()
             try:
                 fast = None
                 force_vision = bool(contract['references']) or self.vision_phase or (self.group_phase and
                     batch[0].get('subject_preview', {}).get('human_count') == 0)
                 if self.people and not force_vision:
                     window = batch[0]
-                    for offset in (0., .3, -.3):
+                    for offset in ((0.,) if window.get('source_sound') else (0., .3, -.3)):
                         shifted = {**window, 'start_sec': window['start_sec']+offset,
                                    'end_sec': window['end_sec']+offset}
                         tail = window.get('transition_tail_fallback_sec', 0)
@@ -645,6 +679,14 @@ class ProgressiveSelector:
                 details = observed.get('details', [{} for _ in batch])[sample_index]
                 run = {**window, **details, 'character_id': char['id'], 'mouth': mouth,
                        'voice_hint': 'speech' if mouth >= 2 else 'neutral'}
+                if window.get('source_sound', {}).get('action'):
+                    from .single import confirm_source_event
+                    if getattr(self, 'source_session', None):
+                        self.source_session.release_for_vision()
+                    action = confirm_source_event(window, contract, self.client, self.cache, self.deadline)
+                    if not action:
+                        continue
+                    run['visual_action'] = action
                 if run.get('final_scene_transition_fallback') or run.get('timeline_visible_prefix'):
                     run['end_sec'] = run['selection_out_sec']+.08
                 self.runs.append(run)

@@ -117,7 +117,7 @@ def test_pipeline_transcribes_verified_ranges_and_keeps_original_source_times(jo
     monkeypatch.setattr(search,'search_video',find)
     plan=pipeline.run_pipeline(config)['plan']
     assert scanned==['first.mp4']
-    assert speech==[('first.mp4',[(6,14)])]
+    assert speech==[('first.mp4',[(0.,30.)])]  # Stable audio core is shared across visual windows.
     cut=plan['slots'][0]['video']
     assert 6 <= cut['in_sec'] and cut['out_sec'] <= 14
     assert plan['video_analysis_meta']['analyzed_sources'][0]['verified_seconds']==8

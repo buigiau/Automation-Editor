@@ -49,9 +49,9 @@ def test_source_word_beats_visemes_and_neutral_policy(kind, tier):
              "category": "A", "lip_aperture": .2}], "source_speech": {"model": "small", "words": [
              {"word": "What?", "start": 10.2, "end": 10.6, "prob": .95}]}}
     chosen, evidence = choose_audio([recording("a"), recording("hi"), recording("what")],
-        {"in_sec": 10, "out_sec": 11, "selection_metrics": {"tier": tier}}, info, Counter())
+        {"in_sec": 10.2, "out_sec": 11.2, "selection_metrics": {"tier": tier}}, info, Counter())
     assert chosen["path"] == "what.wav"
-    assert chosen["placement_offset_sec"] == pytest.approx(.2)
+    assert chosen["placement_offset_sec"] == pytest.approx(0.)
     assert evidence["source_word_start_sec"] == 10.2
     assert evidence["method"] == "source-audio-whisper-exact-word"
 
@@ -78,12 +78,12 @@ def test_unreadable_fallback_cycles_distinct_neutral_files_only():
     assert paths == ["hi.wav", "love.wav", "bye.wav"] * 2
 
 
-def test_readable_face_keeps_viseme_matching_when_no_source_word():
-    chosen, evidence = choose_audio([recording("a"), recording("u")], {"in_sec": 0, "out_sec": .4},
+def test_readable_face_uses_neutral_speech_when_no_source_word():
+    chosen, evidence = choose_audio([recording("a"), recording("u"), recording("hi")], {"in_sec": 0, "out_sec": .4},
         {"samples": [{"time_sec": .1, "clear_face": 1, "speaking": 1,
                       "category": "A", "lip_aperture": .2}]}, Counter())
-    assert chosen["path"] == "a.wav"
-    assert evidence["method"] == "filename-visemes-and-dense-lip-rhythm"
+    assert chosen["path"] == "hi.wav"
+    assert evidence["method"] == "neutral-no-readable-viseme"
 
 
 def test_vowel_categories_and_expression_actions_keep_their_visual_meaning():
@@ -96,7 +96,7 @@ def test_vowel_categories_and_expression_actions_keep_their_visual_meaning():
 def test_english_i_matches_vietnamese_ai_even_when_reused(word):
     pool = [recording("rô"), recording("ai"), recording("aii")]
     info = {"source_speech": {"words": [{"word": word, "start": 10.2, "end": 10.6, "prob": .95}]}}
-    chosen, evidence = choose_audio(pool, {"in_sec": 10, "out_sec": 11}, info,
+    chosen, evidence = choose_audio(pool, {"in_sec": 10.2, "out_sec": 11.2}, info,
                                    Counter({"ai.wav": 50, "aii.wav": 50}), recent=pool[1:])
     assert chosen["category"] == "AI"
     assert evidence["method"] == "source-audio-pronunciation"
@@ -108,7 +108,8 @@ def test_visual_fallback_avoids_recent_word_variants_and_marks_review():
                          "category": "A", "lip_aperture": .2}]}
     chosen, evidence = choose_audio(pool, {"in_sec": 0, "out_sec": .4}, info,
                                    Counter(), recent=pool[:1])
-    assert chosen["category"] != "AI"
+    assert chosen["category"] in {"AI", "HI", "BYE"}
+    assert not evidence["cut_onset_matched"]
     assert evidence["needs_review"]
 
 

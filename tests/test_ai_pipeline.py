@@ -56,6 +56,17 @@ def job(tmp_path, monkeypatch):
     monkeypatch.setattr(ai, 'check_visual_duplicates', lambda rows, *args: (rows, []))
     import autoedit.video.silent_source as silent
     monkeypatch.setattr(silent, 'prepare_video_only_source', lambda path, *args, **kwargs: path)
+    # Media decoding/ASR is covered separately; transport fixtures contain dummy
+    # files and supply deterministic source word evidence to the shared service.
+    from autoedit.audio.search import SourceMatchSession
+    from autoedit.video import reader
+    original_init = SourceMatchSession.__init__
+    def session_init(self, *args, **kwargs):
+        kwargs['scan'] = lambda **k: {'has_audio': True, 'status': 'transcribed', 'events': [],
+            'words': [{'word': 'Hi', 'start': t, 'end': t+.2, 'prob': .99} for t in (1., 12.)]}
+        original_init(self, *args, **kwargs)
+    monkeypatch.setattr(SourceMatchSession, '__init__', session_init)
+    monkeypatch.setattr(reader, 'sampled_frames', lambda *a, **k: iter(()))
     calls = []
     class Client:
         def __init__(self, *args):
@@ -171,7 +182,7 @@ def test_local_backend_does_not_upload_or_use_gemini_and_records_provenance(job,
     assert plan['slots'][0]['video']['character_selection']['method'] == 'qwen-local-visual'
     assert plan['slots'][0]['video']['character_selection']['decision'] == 'uncertain'
     assert plan['slots'][0]['video']['character_selection']['needs_review'] is True
-    assert plan['cubase_slots'][0]['audio_match']['method'] == 'qwen-local-visual-voice'
+    assert plan['cubase_slots'][0]['audio_match']['method'] == 'neutral-source-unmatched'
     assert not any(c[0] == 'upload' for c in calls)
     assert any(c[0] == 'unload' for c in calls)
     cfg['job']['output_dir'] += '-cached'
@@ -195,13 +206,18 @@ def test_progressive_backend_exports_complete_bundle_and_honest_search_scope(job
     monkeypatch.setattr(ai, 'NativeVisionClient', Client)
     monkeypatch.setattr(ai, 'GeminiClient', lambda *a: pytest.fail('Progressive backend used Gemini'))
     consumed = []
-    def candidates(*a, **k):
+    def candidates(self, contract):
+        source = self.sources[0]
+        self.scan(source, 0, 30)
+        anchor = source['sound_anchors'][0]
         for index in range(100):
             consumed.append(index)
             yield {'source_id': 'source-1', 'shot': index, 'shot_start_sec': index,
-                'shot_end_sec': index+2., 'start_sec': index+.1, 'end_sec': index+1.9,
+                'shot_end_sec': index+3., 'start_sec': anchor['start']-.08, 'end_sec': anchor['start']+1.08,
+                'source_sound': anchor, 'sound_slot_id': 'fill-a',
                 'image': 'not-used.jpg'}
-    monkeypatch.setattr(discovery, 'distributed_candidates', candidates)
+    from autoedit.audio.search import SourceMatchSession
+    monkeypatch.setattr(SourceMatchSession, 'windows', candidates)
     monkeypatch.setattr(discovery, 'classify', lambda batch, *a: {
         'cast': [{'id': 'car', 'reference_ids': []}], 'labels': [[0, 2] for _ in batch],
         'details': [{'subject_count': 1, 'sample_frames': 3, 'identity_sample_frames': 0,
@@ -216,7 +232,7 @@ def test_progressive_backend_exports_complete_bundle_and_honest_search_scope(job
     assert plan['video_analysis_meta']['character_ranking_scope'] == 'classified_candidate_windows'
     assert not plan['slots'][0]['video']['local_character_verified']
     assert plan['slots'][0]['video']['character_selection']['method'] == 'cpu-people-2'
-    assert plan['cubase_slots'][0]['audio_match']['method'] == 'cpu-people-2-voice'
+    assert plan['cubase_slots'][0]['audio_match']['method'] == 'source-audio-whisper-exact-word'
     assert not plan['slots'][0]['video']['identity_sample_consistent']
     assert plan['slots'][0]['video']['character_sample_frames'] == 0
     assert len(consumed) == 1 < 100
@@ -295,7 +311,7 @@ def test_single_repair_and_partial_survives_without_stale_plan(job, monkeypatch)
     with pytest.raises(ai.SelectionIncomplete, match='Search stopped: time_budget; 11 candidates checked') as stopped:
         ai.run_ai_pipeline(cfg)
     assert 'Hard local time limit: 570s' in str(stopped.value)
-    assert 'local_max_seconds=0' in str(stopped.value)
+    assert 'audio.source_match_search_budget_sec' in str(stopped.value)
     assert 'remain cached' in str(stopped.value)
     out = Path(cfg['job']['output_dir'])
     assert len(count) == 2
@@ -330,7 +346,7 @@ def test_default_shortage_exports_full_draft_preserves_good_fill_and_allows_revi
     assert plan['slots'][0]['video']['character_id'] == 'car'
     assert plan['slots'][0]['video']['in_sec'] == 1.
     assert plan['slots'][1]['video']['completion_fallback']
-    assert plan['slots'][1]['video']['character_selection']['method'] == 'draft-completion-1'
+    assert plan['slots'][1]['video']['character_selection']['method'] == 'draft-completion-2-neutral-speech'
     assert plan['ai_selection']['completion']['validated_count'] == 1
     assert plan['ai_selection']['analysis_scope']['stop_reason'] == stop_reason
     out = Path(cfg['job']['output_dir'])

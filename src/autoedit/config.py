@@ -30,7 +30,8 @@ DEFAULTS: dict[str, Any] = {
         "video_track_index": 1,
         "import_mixdown": True,
     },
-    "audio": {"directory": r"D:\Editor\Voice", "glob": "*.wav", "files": [], "max_files": 0},
+    "audio": {"directory": r"D:\Editor\Voice", "glob": "*.wav", "files": [], "max_files": 0,
+              "source_match_search_budget_sec": 300},
     "video": {
         "analysis_mode": "until_filled",
         "verification_mode": "verified",

@@ -8,6 +8,7 @@ from autoedit.audio.taxonomy import TAXONOMY, item_group, item_phonetics, sound_
 from autoedit.audio.onsets import AudioOnsetError, articulation_onsets, source_onset
 from autoedit.audio.pronunciation import VoiceIndex, source_sounds, valid_sound
 from autoedit.cubase.inspect import duplicate_scene_tracks, parse_sampler_tracks
+from autoedit.audio.matching import neutral_pool, visual_event_confirmed, POLICY_VERSION
 
 WORD_SHAPES = {sound.label: sound.visemes[0] for _, sound in TAXONOMY.values()
                if sound.visemes and sound.action == "SPEECH" and sound.label not in {"A", "E", "O", "U"}}
@@ -42,7 +43,7 @@ def _cut_samples(video_info, video, padding=0.):
 
 def _source_word_audio(candidates, video, video_info, used):
     start, end = video["in_sec"], video["out_sec"]
-    onset_slack = .25 if video_info.get('verify_onsets') else .001
+    onset_slack = 1/max(1., float(video.get('source_fps') or 30.)) + 1e-6
     anchor = video.get("source_sound")
     if anchor:
         if not valid_sound(anchor) or abs(anchor["start"]-start) > onset_slack or anchor["end"] > end:
@@ -50,7 +51,8 @@ def _source_word_audio(candidates, video, video_info, used):
         sound = anchor
         paths = {m['path'] for m in anchor['matches']}
         # Saved anchors cannot bypass a corrected taxonomy or event/speech gate.
-        supported = [m for m in VoiceIndex(candidates).match(sound) if m['path'] in paths]
+        index = video_info.get('_voice_index') or VoiceIndex(candidates)
+        supported = [m for m in index.match(sound) if m['path'] in paths]
     else:
         # The first sound blocks all later words, even if it is unsupported or
         # uncertain. A cut through a word must not match the following word.
@@ -62,9 +64,12 @@ def _source_word_audio(candidates, video, video_info, used):
             return None
         sound = sounds[0]
         threshold = .75 if sound.get("action") else .6
-        if not start-(.25 if video_info.get('verify_onsets') else 0) <= sound["start"] <= start+.25 or sound["end"] > end or sound["prob"] < threshold:
+        if abs(sound['start']-start) > onset_slack or sound["end"] > end or sound["prob"] < threshold:
             return None
-        supported = VoiceIndex(candidates).match(sound)
+        index = video_info.get('_voice_index') or VoiceIndex(candidates)
+        supported = index.match(sound)
+    if sound.get('action') and not visual_event_confirmed(sound, video, _cut_samples(video_info, video)):
+        return None
     matches = {m["path"]: m for m in supported}
     ranked, seen = [], set()
     for item in candidates:
@@ -111,7 +116,10 @@ def _source_word_audio(candidates, video, video_info, used):
                                   "source_word": row[4].get("word"), "score": round(row[0], 4)}
                                  for row in sorted(ranked, key=lambda row: -row[0])[:3]]}
     evidence.update(sound_type=sound_type(phon.get('action', 'UNCLEAR')), onset_verified=False)
-    if onset:
+    evidence['policy_version'] = POLICY_VERSION
+    if word.get('action'):
+        evidence.update(visual_event_confirmed=True, confidence_kind='heuristic-not-calibrated')
+    if onset and not anchor:
         evidence.update(onset, suggested_cut_in_sec=onset['visual_onset_sec'],
                         onset_error_sec=onset['visual_onset_sec']-word['start'])
         chosen['placement_offset_sec'] = max(0., onset['visual_onset_sec']-start)
@@ -121,13 +129,7 @@ def _source_word_audio(candidates, video, video_info, used):
 
 
 def choose_audio(candidates, video, video_info, used, recent=()):
-    """Prefer source words, then measured visemes, then neutral recordings.
-
-    Onset search moves the recording, without stretching or pitching it. This
-    is visual matching, not a claim to recover words from silent mouth motion.
-    """
-    import numpy as np
-
+    """Match the opening source sound; otherwise use curated neutral speech."""
     samples = _cut_samples(video_info, video)
     strict = (video.get("selection_metrics") or {}).get("require_lip_motion")
     if strict:
@@ -139,95 +141,10 @@ def choose_audio(candidates, video, video_info, used, recent=()):
     exact = _source_word_audio(candidates, video, video_info, used)
     if exact:
         return exact
-    candidates = select_audio_for_source(candidates, video_info.get("source_kind", "live_action"))
-    if not strict and (not samples or (video.get("selection_metrics") or {}).get("tier", 1) >= 3):
-        return _coarse_audio(candidates, video, video_info, used)
-    duration = video["out_sec"] - video["in_sec"]
-    # Closed/preparatory and closing samples are essential negative evidence.
-    times = np.array([s["time_sec"] - video["in_sec"] for s in samples])
-    aperture = np.array([s.get("lip_aperture", s.get("openness", 0) / 2) for s in samples])
-    opened = np.clip(aperture / max(float(np.quantile(aperture, .9)), .08), 0, 1)
-    shapes = ["M" if a < .035 else _shape(s.get("category")) for a, s in zip(aperture, samples)]
-    ranking = []
-    seen = set()
-    for item in candidates:
-        # Whole recordings already contain the labelled active range. Expanded
-        # duplicate segments must not bias the ranking or reuse penalty.
-        if item["path"] in seen:
-            continue
-        seen.add(item["path"])
-        phon = item_phonetics(item)
-        action = phon.get("action", "SPEECH")
-        # Events require source-event evidence, never expression similarity.
-        if action != 'SPEECH':
-            continue
-        lo = float(item.get("active_start_sec", item.get("segment_start_sec", 0)) or 0)
-        hi = float(item.get("active_end_sec", item.get("segment_end_sec", item.get("duration_sec", 0))) or 0)
-        length = hi - lo
-        if not math.isfinite(length) or length <= 0:
-            continue
-        visemes = phon.get("visemes") or [_shape(item.get("category"))]
-        env = np.array(item.get("envelope") or [1., 1.])
-        step = float(item.get("envelope_step_sec") or length)
-        # Legacy callers may shift/trim their preview. The verified pipeline
-        # moves the video cut instead, preserving the recording's initial sound.
-        shifts = np.arange(-min(max(0, length-duration), .3), min(.3, max(0, duration-length)) + .001, .025)
-        onset_samples = _cut_samples(video_info, video, .35)
-        onsets = articulation_onsets(onset_samples, visemes, max(0, video['in_sec']-.25),
-                                    min(video['out_sec']-.05, video['in_sec']+.3))
-        if video_info.get('verify_onsets'):
-            shifts = np.array([p['visual_onset_sec']-video['in_sec'] for p in onsets])
-        for shift in shifts:
-            local = times - shift
-            active = (local >= 0) & (local < length)
-            energy = np.interp(local + lo, np.arange(len(env))*step, env, left=0, right=0) * active
-            progress = np.clip(local / length, 0, .999999)
-            sound_shapes = [visemes[int(p * len(visemes))] if on else "M" for p, on in zip(progress, active)]
-            overlap = float(np.mean([same_family(a, b) for a, b in zip(shapes, sound_shapes)]))
-            rhythm = float(1 - np.mean(np.abs(energy - opened)))
-            fit = min(length, duration) / max(length, duration)
-            retained = max(0, min(duration, shift+length)-max(0, shift))/length
-            score = 3*overlap + 2*rhythm + fit + .5*retained
-            if video_info.get('verify_onsets'):
-                score -= 4*abs(float(shift))
-            # Moving the cut preserves the recording's initial articulation.
-            ranking.append((score, overlap, rhythm, fit, shift, lo, hi, item))
-    if not ranking:
-        if video_info.get('verify_onsets'):
-            raise AudioOnsetError('No labelled speech recording has a compatible articulation onset', video)
-        raise ValueError("No labelled speech samples match this scene; review the Voice library labels.")
-    # Avoid cycling back to the same word via another filename (ai/aii).
-    # Exact transcript matches above always retain priority over variety.
-    def label(item):
-        return item.get("category") or item["path"]
-    previous = {label(item) for item in recent[-2:]}
-    fresh = [r for r in ranking if label(r[-1]) not in previous]
-    if fresh:
-        ranking = fresh
-    ranking.sort(key=lambda r: (-(r[0] - .6*used[r[-1]["path"]]), r[-1]["path"]))
-    score, overlap, rhythm, fit, shift, lo, hi, item = ranking[0]
-    chosen = dict(item, segment_start_sec=lo if video_info.get('verify_onsets') else lo + max(0, -shift), segment_end_sec=hi,
-                  placement_offset_sec=max(0, float(shift)))
-    alternatives = []
-    for row in ranking:
-        name = row[-1].get("name", row[-1]["path"])
-        if name not in [x["name"] for x in alternatives]:
-            alternatives.append({"name": name, "score": round(row[0], 4)})
-        if len(alternatives) == 3:
-            break
-    evidence = {"score": round(score, 4), "shape_overlap": round(overlap, 4),
-        "rhythm_fit": round(rhythm, 4), "duration_fit": round(fit, 4),
-        "onset_shift_sec": round(float(shift), 4), "lip_sample_count": len(samples),
-        "method": "filename-visemes-and-dense-lip-rhythm", "phoneme_sync_verified": False,
-        "needs_review": True, "review_reason": "No supported source word; visual fallback only",
-        "reuse_count": used[item["path"]], "alternatives": alternatives}
-    evidence.update(sound_type='speech', onset_verified=False)
-    if video_info.get('verify_onsets'):
-        proof = next(p for p in articulation_onsets(_cut_samples(video_info, video, .35),
-            item_phonetics(item).get('visemes'), max(0, video['in_sec']-.25), video['in_sec']+.3)
-            if abs(p['visual_onset_sec']-video['in_sec']-float(shift)) < 1e-6)
-        evidence.update(proof, suggested_cut_in_sec=video['in_sec']+float(shift))
-    return chosen, evidence
+    candidates = neutral_pool(select_audio_for_source(candidates, video_info.get("source_kind", "live_action")))
+    if not candidates:
+        raise ValueError('No usable NEUTRAL speech recordings for unmatched source openings.')
+    return _coarse_audio(candidates, video, video_info, used)
 
 
 def _coarse_audio(candidates, video, video_info, used):
@@ -252,6 +169,7 @@ def _coarse_audio(candidates, video, video_info, used):
     chosen = dict(item, segment_start_sec=lo, segment_end_sec=min(hi, lo+duration),
                   placement_offset_sec=0.0, audio_style="NEUTRAL")
     return chosen, {"score": round(-negative_score, 4), "duration_fit": round(fit, 4),
+                    'policy_version': POLICY_VERSION, 'cut_onset_matched': False,
                     "method": "neutral-no-readable-viseme", "phoneme_sync_verified": False,
                     'sound_type': 'speech', 'onset_verified': False,
                     "needs_review": True, "reuse_count": reuse}
@@ -259,6 +177,7 @@ def _coarse_audio(candidates, video, video_info, used):
 
 def build_sampler_slots(scenes, video_slots, candidates, video_info, inventory):
     tracks = inventory["tracks"]
+    video_info = {**video_info, '_voice_index': VoiceIndex(candidates)}
     expected = parse_sampler_tracks(inventory.get("selected_track_indices"))
     if expected is None:
         expected = list(range(1, len(scenes)+1))

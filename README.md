@@ -1,10 +1,34 @@
 # Automation-Editor
 
-The default GUI now opens the **Preset + AI** workflow: choose Soda Pop,
-Golden or Cosita, an output folder and source videos, with optional character
-images. Set template pairs, Voice and the AI backend once in **Thiết lập**.
-Use `AutoEdit-Local.cmd` for Qwen3-VL 4B Instruct locally without an API key,
-or select Gemini and save its key. Local Voice estimates require playback review.
+The default GUI opens **AutoEdit Studio**: choose Soda Pop, Golden or Cosita,
+an output root and source videos, with optional character images. Set template
+pairs, Voice and the AI backend once in **Thiết lập**.
+Use **Thêm job** to submit a job, then prepare the next one while the
+current job runs. Every submission snapshots its settings, sources and references
+and gets its own named output subfolder; queued jobs cannot overwrite each other.
+Jobs run in submission order, one worker at a time, for both local AI and Gemini.
+**Tạm dừng** holds the next jobs without interrupting the current job; **Tiếp tục**
+resumes dispatch. Cancel a selected waiting job or stop the running job separately.
+After an error or cancellation the next job starts only after the worker exits.
+Select a job for its output, review and Cubase actions; **Nhật ký** opens its
+own log. **Làm mới** clears the new-job form without changing submitted jobs.
+The queue is held for the current application session: closing cancels unfinished
+jobs. Completed output folders and the shared analysis cache remain on disk.
+The desktop launchers load `config.yaml`. GPU and Local require `.venv-gpu`;
+the CPU launcher can also use `.venv`. `AutoEdit-Local.cmd` checks/installs Qwen
+and activates the saved local model before opening the Studio, without an API key
+(new default: `qwen3-vl:2b-instruct`). You can also install/check Qwen under **Thiết lập**,
+or select Gemini and save its key. All backends now use the same opening-source
+word/pronunciation matcher before selecting footage and Voice. Qwen inspects
+images; a separate local Whisper worker supplies the soundtrack evidence.
+Unmatched scenes use curated neutral speech, never laughter chosen by duration.
+Source-event hints require visible action and always require listening review.
+`audio.source_match_search_budget_sec` defaults to 300 seconds in fast mode;
+matching and scene search stop early when complete. Full mode scans the configured
+source scope. File preparation/export is outside this search budget.
+Fast search reserves up to 30 seconds within that budget for neutral draft
+completion. If media cannot produce a decodable draft in time, completed evidence
+is retained for review rather than publishing an invalid or stale apply bundle.
 Local defaults to 2 CPU threads; GPU requires an explicit choice in settings.
 AI shortages now default to a complete draft: preserve validated cuts and fill
 remaining slots with explicitly marked footage for review. This also handles local
@@ -22,8 +46,8 @@ priority. Restart the GUI after changing `config.yaml` so it loads these setting
 Use **Fast export; review faces, lips and voice afterward** (or
 `video.verification_mode: review`) to export the complete allocation before
 dense face/lip/onset checks. Character exposure ranking and source gaps remain
-active. This mode uses up to four identity images per track and transcribes
-only the selected source ranges. Every scene and voice is marked for manual
+active. This mode uses up to four identity images per track and searches source
+audio before finalizing the selected ranges. Every scene and voice is marked for manual
 review; `verification_mode: verified` restores the dense verification gate.
 
 ## Candidate search and queued jobs
@@ -152,9 +176,10 @@ them automatically. Unknown labels remain uncertain rather than generic speech.
 
 Selected readable mouths are refined with 350 ms context and original-frame
 measurements around the opening. Articulation checks distinguish opening,
-reshaping and closed-consonant release from preparation/closing. Cuts may move
-to the measured onset; full-window person/character evidence, gaps, boundaries
-and durations are then checked again. Visual fallback remains an estimate
+reshaping and closed-consonant release from preparation/closing. Source-matched
+cuts keep their opening sound; image-only onsets cannot authorize an unrelated
+WAV. Full-window person/character evidence, gaps, boundaries and durations are
+checked again. Neutral fallback remains an estimate
 (`phoneme_sync_verified: false`); unreadable mouths require review. These local
 checks do not claim exact phoneme recognition. Cubase MIDI is preserved and
 `cubase_timing_verified` remains false until actual playback is checked; the
@@ -245,8 +270,9 @@ The pipeline scans the original soundtrack across the analyzed part of the
 source video before choosing cuts. Confident words that match the shared Voice
 library supply candidate cut onsets. Each cut keeps the Premiere slot duration,
 person/face requirements, transition checks, character filters and source gaps.
-Character exposure rank takes priority among qualifying cuts. Within each cast
-rank, qualifying sound onsets take priority; visual selection fills remaining slots.
+Within the configured character/reference eligibility rules, qualifying sound
+onsets take priority over exposure/visual variety. Neutral speech fills remaining
+slots after source search is exhausted or the fast-search budget is reached.
 Words with Whisper probability at least 0.8 rank first; supported words from
 0.6 to 0.8 rank second and require listening review. Lower scores fall back.
 
@@ -260,9 +286,17 @@ Matching compares complete word pronunciations, not arbitrary substrings.
 
 Only the sound at the opening of a scene determines its WAV. A selected word
 onset is carried into the plan with its supported sample paths; later words
-cannot replace it. Visual fallback cuts may match their first sound within
-250 ms of the cut. Mid-word cuts and unsupported openings use measured mouth
-shapes and timing, marked for review. Each scene has one WAV, including later reprises.
+cannot replace it. One frame of timestamp quantization is allowed at the opening.
+Mid-word cuts and unsupported openings use curated neutral speech, marked for
+review. Each scene has one WAV, including later reprises. Manual changes recompute
+the evidence without re-running ASR or silently moving a fixed cut.
+
+Source audio is cached in stable 30-second regions across output folders and
+backends. Changing Voice rebuilds pronunciation matches without transcribing the
+same source again. `source_audio_search.json` (AI workflow) and the plan's
+`source_audio_search` record ASR time, cache hits, match/fallback counts and stop
+reason. An owned ASR subprocess can be terminated at the search deadline;
+recognition failures are reported separately from sources without audio.
 
 The default requires readable faces (`video.require_clear_face: true`) while
 `video.require_lip_motion: false` permits silent faces and unreadable lips. Facial
