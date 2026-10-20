@@ -16,6 +16,20 @@ def test_optional_references_enable_identity_without_changing_auto_default():
     assert settings()['reference_images'] == []
     with pytest.raises(ValueError, match='list of image paths'):
         settings({'reference_images':'actor.png'})
+    assert settings()['body_reference_cosine_distance'] == .30
+    assert settings()['ccip_cosine_distance'] == .20
+
+
+def test_large_body_crop_is_usable_even_when_measured_head_is_too_small():
+    from autoedit.video.embeddings import EmbeddingModel
+    model=object.__new__(EmbeddingModel)
+    model.kind='animation'
+    model.size=32
+    model._run=lambda tensor:[np.array([[1.,0.]],np.float32)]
+    frame=np.zeros((100,100,3),np.uint8)
+    subject={'face':[40,10,10,10],'subject_kind':'object','subject_box':[20,5,60,80]}
+    assert model.extract(frame,subject,100,100).tolist()==[1.,0.]
+    assert model.extract(frame,{**subject,'subject_kind':'face'},100,100) is None
 
 
 def test_reference_matching_needs_multiple_consistent_crops_and_not_an_ensemble(monkeypatch, tmp_path):
@@ -35,6 +49,33 @@ def test_co_visible_lookalikes_are_ambiguous(monkeypatch, tmp_path):
     match_reference_tracks(tracks,'animation',settings({'reference_images':['actor.png']}),tmp_path,
                            {'model_sha256':'model'})
     assert all(not t['reference_match'] and t['reference_ambiguous'] for t in tracks)
+
+
+def test_confirmed_body_views_are_bounded_to_original_identity_and_cannot_learn_a_chain(monkeypatch, tmp_path):
+    import math
+    def vector(distance):
+        return [1-distance, math.sqrt(1-(1-distance)**2)]
+    catalog = {'images':['body.png'], 'templates':[{'id':'target', 'image_index':0, 'subject_kind':'object'}],
+               'skipped_regions':[]}
+    monkeypatch.setattr('autoedit.video.references.reference_vectors', lambda *a: ([[1.,0.]],catalog))
+    gallery = {}
+    config = settings({'reference_images':['body.png'], '_reference_gallery':gallery,'body_reference_cosine_distance':.20})
+    def body(name, distance, count=3):
+        return {**track(name,vector(distance),0,2,0), 'subject_kind':'object', 'vectors':[vector(distance)]*count}
+    seed = body('seed', .15)
+    match_reference_tracks([seed],'animation',config,tmp_path,{'model_sha256':'one'})
+    assert seed['reference_match']
+    saved = deepcopy(gallery)
+    adapted, too_far, single = body('adapted', .27), body('other', .45), body('single', .27, 1)
+    # Different times avoid introducing co-visible ambiguity into this test.
+    too_far['intervals'], single['intervals'] = [[3,5]], [[6,8]]
+    match_reference_tracks([adapted,too_far,single],'animation',config,tmp_path,{'model_sha256':'one'})
+    assert adapted['reference_match'] and adapted['reference_method'] == 'confirmed-reference-view'
+    assert not too_far['reference_match'] and not single['reference_match']
+    assert gallery == saved
+    fresh = body('fresh', .27)
+    match_reference_tracks([fresh],'animation',config,tmp_path,{'model_sha256':'different-model'})
+    assert not fresh['reference_match']
 
 
 def test_reference_cache_is_content_and_model_specific(tmp_path, monkeypatch):
@@ -72,6 +113,65 @@ def test_invalid_reference_is_not_silently_ignored(tmp_path):
     with pytest.raises(ValueError, match='Invalid character reference'):
         reference_vectors('live_action',settings({'reference_images':['missing.png']}),tmp_path,
                           {'model_sha256':'model'})
+
+
+def test_cartoon_without_isolated_face_requires_explicit_crop(tmp_path,monkeypatch):
+    import cv2
+    from autoedit.video.references import preflight_references
+    path=tmp_path/'group.png'
+    cv2.imencode('.png',np.zeros((100,200,3),np.uint8))[1].tofile(str(path))
+    class Detector:
+        def __init__(self,**kw):
+            pass
+        def detect(self,*a):
+            return {'faces':[]}
+        def close(self):
+            pass
+    monkeypatch.setattr('autoedit.video.faces.MultiRegionFaceLandmarker',Detector)
+    cfg=settings({'reference_images':[str(path)]})
+    with pytest.raises(ValueError,match='Review / crop'):
+        preflight_references(cfg,'animation')
+    cfg['reference_regions']={str(path):[{'box':[0,0,80,100],'kind':'body'}]}
+    preflight_references(cfg,'animation')
+
+
+def test_body_reference_selection_is_cached_by_crop_and_matches_body_preprocessing(tmp_path,monkeypatch):
+    import cv2
+    path=tmp_path/'group.png'
+    cv2.imencode('.png',np.zeros((100,200,3),np.uint8))[1].tofile(str(path))
+    calls=[]
+    class Model:
+        def __init__(self,*a):
+            pass
+        def extract(self,frame,subject,*args):
+            calls.append(subject)
+            assert subject['subject_kind']=='object'
+            assert subject['subject_box']==subject['face']
+            return np.asarray([1.,0.])
+    monkeypatch.setattr('autoedit.video.references.EmbeddingModel',Model)
+    cfg=settings({'reference_images':[str(path)],'reference_regions':{str(path):[
+        {'box':[0,0,80,100],'kind':'body'}]}})
+    first,catalog=reference_vectors('animation',cfg,tmp_path,{'model_sha256':'same'})
+    reference_vectors('animation',cfg,tmp_path,{'model_sha256':'same'})
+    assert len(calls)==1 and catalog['templates'][0]['selected_region']
+    cfg['reference_regions'][str(path)][0]['box']=[100,0,80,100]
+    reference_vectors('animation',cfg,tmp_path,{'model_sha256':'same'})
+    assert len(calls)==2
+
+
+def test_head_and_body_reference_features_cannot_be_mixed(monkeypatch,tmp_path):
+    catalog={'images':['head.png','body.png'],'templates':[
+        {'id':'head','image_index':0,'subject_kind':'face'},
+        {'id':'body','image_index':1,'subject_kind':'object'}],'skipped_regions':[]}
+    monkeypatch.setattr('autoedit.video.references.reference_vectors',lambda *a:([[1.,0.],[0.,1.]],catalog))
+    config=settings({'reference_images':['head.png','body.png']})
+    subject={**track('subject',[0,1],0,3,0),'reference_face_vectors':[[1,0],[1,0]]}
+    # Equally good but conflicting head/body identity evidence must abstain.
+    result=match_reference_tracks([subject],'animation',config,tmp_path,{'model_sha256':'model'})
+    assert result['matched_tracks']==0 and subject['reference_ambiguous']
+    subject={**track('subject',[1,0],0,3,0),'reference_face_vectors':[[1,0],[1,0]]}
+    result=match_reference_tracks([subject],'animation',config,tmp_path,{'model_sha256':'model'})
+    assert result['matched_tracks']==1 and subject['reference_id']=='head'
 
 
 def test_reference_priority_is_independent_of_exposure_rank_and_cannot_be_momentary():

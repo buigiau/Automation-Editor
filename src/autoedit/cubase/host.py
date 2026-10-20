@@ -84,12 +84,16 @@ def import_samples(plan_path, log=print):
     session = plan_path.parent / "cubase_imports" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     session.mkdir(parents=True)
     before, after = session / "before.xml", session / "after.xml"
-    log(f"Reading your Cubase selection; manually select all {len(slots)} numbered Sampler Tracks before import")
+    expected_names = [s["cubase"]["track_name"] for s in slots]
+    log(f"Reading your Cubase selection; expected {len(slots)} Sampler Tracks: " + ", ".join(expected_names))
     root = _export(app, window, before).getroot()
     expected = {s["cubase"]["track_name"] for s in slots}
     if set(sampler_tracks(root)) != expected:
-        raise RuntimeError(f"Cubase selection did not contain exactly the expected {len(slots)} Sampler Tracks. "
-                           "Select the numbered Sampler Tracks manually, then retry Import Cubase. No samples were changed.")
+        actual = set(sampler_tracks(root))
+        missing, extra = sorted(expected - actual), sorted(actual - expected)
+        raise RuntimeError(f"Cubase selection does not match this plan. Missing from selection: {', '.join(missing) or 'none'}. "
+                           f"Selected but absent from plan: {', '.join(extra) or 'none'}. "
+                           "Check the plan's sampler mapping and manually selected tracks, then retry Import Cubase. No samples were changed.")
     archive = prepare_archive(before, slots, session / "samples.xml")
     log("Loading samples into the open Cubase project; the project will remain unsaved")
     window.menu_select("File->Import->Track Archive...")

@@ -146,7 +146,7 @@ def test_pipeline_keeps_detected_name_structure_and_audio_scene_bindings(tmp_pat
     config = {"job": {"output_dir": str(tmp_path / "output")},
               "premiere": {"project": str(path), "source_media": "source.mp4"},
               "cubase": {"project": "paired.cpr", "sampler_tracks": sampler_selection},
-              "video": {"require_lip_motion": False, "characters": {"enabled": False}}}
+              "video": {"search_fps": 0, "require_lip_motion": False, "require_clear_face": False, "characters": {"enabled": False}}}
     plan = pipeline.run_pipeline(config)["plan"]
     assert plan["project"]["template_sequence"] == "BEAT MAU"
     assert "template_sequence" not in config["premiere"]  # Runtime detection does not change future jobs.

@@ -116,7 +116,7 @@ def test_pipeline_audio_count_never_changes_video_slot_count(tmp_path, monkeypat
     monkeypatch.setattr(pipeline, "apply_cubase_plan", lambda plan, out: received.append(plan) or {})
     result = pipeline.run_pipeline({
         "job": {"output_dir": str(tmp_path / "output")},
-        "video": {"require_lip_motion": False, "characters": {"enabled": False}},
+        "video": {"search_fps": 0, "require_lip_motion": False, "require_clear_face": False, "characters": {"enabled": False}},
         "cubase": {"project": "test.cpr"},
         "premiere": {"project": str(fixture_project(tmp_path)), "source_media": "source.mp4",
                      "slot_mode": "timeline_clips"},
@@ -175,7 +175,7 @@ def test_pipeline_reselects_static_dense_cut_before_assigning_any_voice(tmp_path
     result = pipeline.run_pipeline({'job':{'output_dir':str(tmp_path/'output')},
         'premiere':{'project':'template.prproj','source_media':'source.mp4'},
         'cubase':{'project':'template.cpr'},
-        'video':{'source_gap_sec':0,'require_lip_motion':True,'characters':{'enabled':False}}})
+        'video':{'search_fps':0,'source_gap_sec':0,'require_lip_motion':True,'characters':{'enabled':False}}})
     assert len(refined) >= 2  # the alternative may need a further onset alignment check
     old, final = refined[0][0], result['plan']['slots'][0]['video']
     assert final['out_sec'] <= old['in_sec'] or final['in_sec'] >= old['out_sec']
@@ -217,7 +217,7 @@ def test_pipeline_rejects_scenery_before_publishing_plan_or_exporting(tmp_path, 
     with pytest.raises(ValueError, match="visible person throughout"):
         pipeline.run_pipeline({"job": {"output_dir": str(tmp_path)},
             "premiere": {"project": "template.prproj", "source_media": "source.mp4"},
-            "cubase": {"project": "template.cpr"}, "video": {"source_gap_sec": 0, "characters": {"enabled": False}}})
+            "cubase": {"project": "template.cpr"}, "video": {"search_fps": 0, "source_gap_sec": 0, "characters": {"enabled": False}}})
     assert plan_path.read_bytes() == b"previous plan"
     assert payload_path.read_bytes() == b"previous payload"
     assert "FAILED" in (tmp_path / "run.log").read_text(encoding="utf-8")

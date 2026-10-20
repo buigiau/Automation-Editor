@@ -164,7 +164,7 @@ def test_pipeline_preserves_sources_through_lip_checks_audio_and_premiere(tmp_pa
     result = pipeline.run_pipeline({"job": {"output_dir": str(tmp_path)},
         "premiere": {"project": "template.prproj", "source_media": ["first.mp4", "second.mp4"]},
         "cubase": {"project": "template.cpr"},
-        "video": {"require_lip_motion": strict, "source_gap_sec": 5, "characters": {"enabled": False}}})
+        "video": {"search_fps": 0, "require_lip_motion": strict, "source_gap_sec": 5, "characters": {"enabled": False}}})
     plan = result["plan"]
     assert transcribed == [("first.mp4", [(0, 5)]), ("second.mp4", [(0, 5)])]
     assert {path for path, selected in refined} == {"first.mp4", "second.mp4"}

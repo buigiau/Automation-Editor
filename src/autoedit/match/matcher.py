@@ -30,6 +30,9 @@ def _has_face(sample):
                      or (sample.get('backend') == 'feature-tracked-face'
                          and sample.get('face_evidence') == 'reversible-face-features'
                          and sample.get('verified_feature_count',0) >= 12)
+                     or (sample.get('backend') == 'grounding-dino-face'
+                         and sample.get('face_evidence') == 'independent-tight-face-query'
+                         and sample.get('face_detector_score',0) >= .3)
                      or (sample.get("backend") == "animation-eyes-mouth" and
                          sample.get("face_evidence") in
                          {"paired-pupils-shared-colour-mouth", "goggle-pupil-yellow-mouth", "goggle-pupil-yellow-face"})))
@@ -47,9 +50,17 @@ def shot_tier(metrics, samples, first, last):
     if not samples or metrics.get("sample_coverage", 1) < 0.999:
         return None
     window = samples[first:last + 1]
+    if metrics.get('promotional_overlay', 0) > 1e-8:
+        return None
     # All four tiers require a person at every sampled point and both brackets.
     # Bodies need independent pose confirmation; low motion alone is never enough.
     if not window or not all(_has_face(s) or _has_body(s) for s in window):
+        return None
+    if metrics.get('require_clear_face') and (
+            metrics.get('readable_face', metrics.get('clear_face', 0)) < .85
+            or metrics.get('face_visible', 0) < .999
+            or not samples[first].get('readable_face', samples[first].get('clear_face'))
+            or not samples[last].get('readable_face', samples[last].get('clear_face'))):
         return None
     continuous = metrics.get("face_continuous")
     if continuous is None:
@@ -142,10 +153,11 @@ def _face_track_candidates(slots, video_info, require_lip_motion, min_tier):
         for face in sample.get('faces', []):
             if face.get('track_id') and (_has_face(face) or _has_body(face)):
                 tracks[face['track_id']].append((index, {**face,'time_sec':sample['time_sec'],
-                    'activity_score':sample.get('activity_score', 0)}))
+                    'activity_score':sample.get('activity_score', 0),
+                    'promotional_overlay':sample.get('promotional_overlay', 0)}))
     result = defaultdict(list)
     fields = ('face_visible','closeup_score','mouth_clarity','clear_face','speaking',
-              'person_visible','full_body_visible','activity_score','sample_coverage','body_visible','subject_clarity')
+              'person_visible','full_body_visible','activity_score','sample_coverage','body_visible','subject_clarity','readable_face','promotional_overlay')
     transitions = sorted(video_info.get('transition_times_sec') or [])
     sound_starts = [float(s['start']) for s in video_info.get('sound_anchors', [])]
     def evaluate(run):
@@ -154,7 +166,8 @@ def _face_track_candidates(slots, video_info, require_lip_motion, min_tier):
         times = np.array([s['time_sec'] for s in run])
         values = np.array([[float(_has_face(s)),s.get('closeup_score',0),s.get('mouth_clarity',0),
                             s.get('clear_face',0),s.get('speaking',0),1,0,
-                            s.get('activity_score',0),1,float(_has_body(s)),s.get('subject_clarity',0)] for s in run])
+                            s.get('activity_score',0),1,float(_has_body(s)),s.get('subject_clarity',0),
+                            s.get('readable_face',s.get('clear_face',0)),s.get('promotional_overlay',0)] for s in run])
         weights = np.diff(np.append(times,times[-1]))
         prefix = np.vstack([np.zeros(len(fields)),np.cumsum(values*weights[:,None],axis=0)])
         def integrated(t):
@@ -169,6 +182,7 @@ def _face_track_candidates(slots, video_info, require_lip_motion, min_tier):
                 after=min(len(run)-1,int(np.searchsorted(times,end,side='left')))
                 window=run[first:after+1]
                 measured=dict(zip(fields,map(float,(integrated(end)-integrated(start))/need)))
+                measured['require_clear_face'] = bool(video_info.get('require_clear_face'))
                 measured.update(transition_metrics(transitions,start,end),face_continuous=True)
                 if not measured['transition_safe']:
                     continue
@@ -250,8 +264,10 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
     samples = sorted(video_info.get("samples") or [], key=lambda s: s["time_sec"])
     times = np.array([s["time_sec"] for s in samples])
     fields = ("face_visible", "closeup_score", "mouth_clarity", "clear_face", "speaking",
-              "person_visible", "full_body_visible", "activity_score", "sample_coverage", "body_visible", "subject_clarity")
+              "person_visible", "full_body_visible", "activity_score", "sample_coverage", "body_visible", "subject_clarity", "readable_face", "promotional_overlay")
     def sample_value(s, key):
+        if key == 'readable_face':
+            return float(s.get('readable_face', s.get('clear_face', 0)))
         if key == "sample_coverage":
             return 1.0
         if key == "face_visible":
@@ -300,10 +316,49 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
     source_spans = video_info.get("source_spans") or []
     free = ([(s["offset_sec"], s["end_sec"]) for s in source_spans]
             if source_spans else [(0.0, duration)])
+    if 'verified_ranges' in video_info:
+        free = [(max(0., float(a)), min(duration, float(b))) for a, b in video_info['verified_ranges']
+                if min(duration, float(b)) > max(0., float(a))]
     used = []
     matches = [None] * len(slots)
     candidate_options = {}
     reference_counts, reference_seconds = {}, {}
+    composition_counts = {}
+    max_similar = video_info.get('max_similar_cuts', 2)
+    if isinstance(max_similar, bool) or not isinstance(max_similar, int) or max_similar < 0:
+        raise ValueError('max_similar_cuts must be a non-negative integer')
+    composition_cache = {}
+
+    def composition_metrics(start, need):
+        key = (start, need)
+        if key not in composition_cache:
+            end = start + need
+            first = max(0, bisect_right(times, start)-1)
+            after = min(len(samples), bisect_right(times, end))
+            totals = {}
+            for j in range(first, after):
+                gid = samples[j].get('composition_id')
+                if gid is None:
+                    continue
+                right = min(end, times[j]+weights[j])
+                weight = max(0., right-max(start, times[j]))
+                totals[gid] = totals.get(gid, 0.) + weight / need
+            # A brief boundary sample cannot debit an unrelated composition.
+            groups = sorted(gid for gid, fraction in totals.items() if fraction >= .2)
+            composition_cache[key] = {'composition_ids':groups,
+                'composition_fractions':totals, 'max_similar_cuts':max_similar}
+        return composition_cache[key]
+
+    def composition_allowed(row, counts):
+        return not max_similar or all(counts.get(gid, 0) < max_similar
+                                     for gid in row[3].get('composition_ids', []))
+
+    def composition_usage(row, counts):
+        return max((counts.get(gid, 0) for gid in row[3].get('composition_ids', [])), default=0)
+
+    def credit_composition(row, counts):
+        for gid in row[3].get('composition_ids', []):
+            counts[gid] = counts.get(gid, 0) + 1
 
     def reference_usage(row, counts, seconds):
         character = row[3].get('character_selection', {})
@@ -394,6 +449,7 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
                 continue
             metrics = (integrated_quality(end) - integrated_quality(start)) / need
             measured = dict(zip(fields, map(float, metrics)))
+            measured['require_clear_face'] = bool(video_info.get('require_clear_face'))
             measured.update(continuity)
             if require_lip_motion:
                 opening_end = min(end, start + .4)
@@ -492,6 +548,10 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
             ranks = [int(rank) for rank,fraction in character.get('rank_fractions', {}).items() if fraction >= minimum]
             # A momentary appearance cannot promote the entire cut's rank.
             return min(ranks, default=1000000)
+        for row in ranked:
+            row[3].update(composition_metrics(row[1], need))
+        if not allocation_search:
+            ranked = [row for row in ranked if composition_allowed(row, composition_counts)]
         ranked.sort(key=lambda row: (
             (0 if row[3].get('character_selection', {}).get('reference_fraction', 0)
                   >= (video_info.get('character_analysis') or {}).get('min_main_fraction', .85) else 1)
@@ -500,6 +560,7 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
             # A recognized primary view with uncertain identity still precedes
             # a known secondary actor; its uncertainty stays visible for review.
             exposure_rank(row),
+            composition_usage(row, composition_counts),
             {"main": 0, "supporting": 1, "uncertain": 2}.get(
                 row[3].get("character_selection", {}).get("decision"), 0),
             sound_by_start[row[1]].get("confidence_tier", 1)
@@ -520,32 +581,45 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
                 break
         if chosen is None:
             speech_note = " Visible lip movement is required in the opening and across the cut; silent/static faces are excluded." if require_lip_motion else ""
+            if video_info.get('require_clear_face'):
+                speech_note += " Readable faces are required across each cut; body-only fallback is disabled."
+            if max_similar and any(s.get('composition_id') for s in samples):
+                speech_note += f" Recurring camera compositions are limited to {max_similar} cuts; video.max_similar_cuts=0 disables this limit."
             raise InsufficientFootageError(f"Not enough qualifying footage with a visible person throughout (tiers {min_tier}-4): selected {step}/{len(slots)} clips; {slot['id']} needs {need:.3f}s with a {gap:g}s source gap and a stable opening without transitions. Longest cuts were reserved first. Scenery and unconfirmed pose detections are excluded. Noise-only character cuts are excluded." + speech_note)
         score, start, seg, metrics, free = chosen
         end = start + need
         used.append((start, end))
         credit_reference((score, start, seg, metrics), need, reference_counts, reference_seconds)
+        credit_composition((score, start, seg, metrics), composition_counts)
         matches[i] = make_match(i, score, start, seg, metrics)
     if allocation_search:
         # Forward checking starts with the slot with fewest available choices.
         # Cache failed states and bound exploration on highly ambiguous inputs.
         failed, nodes = set(), 0
-        def search(remaining, intervals, counts, seconds):
+        def search(remaining, intervals, counts, seconds, views):
             nonlocal nodes
             if not remaining:
                 return {}
             nodes += 1
             if nodes > 20000 or not can_fit(intervals, [needs[j] for j in remaining]):
                 return None
-            state = (remaining, tuple((round(a, 8), round(b, 8)) for a,b in intervals))
+            state = (remaining, tuple((round(a, 8), round(b, 8)) for a,b in intervals), tuple(sorted(views.items())))
             if state in failed:
                 return None
             available = {}
             for index in remaining:
                 available[index] = [row for row in candidate_options[index]
                                     if any(left-1e-8 <= row[1] and row[1]+needs[index] <= right+1e-8
-                                           for left,right in intervals)]
+                                           for left,right in intervals) and composition_allowed(row, views)]
                 if not available[index]:
+                    failed.add(state)
+                    return None
+            if max_similar:
+                groups = {gid for options in available.values() for row in options
+                          for gid in row[3].get('composition_ids', [])}
+                unknown = sum(any(not row[3].get('composition_ids') for row in options)
+                              for options in available.values())
+                if sum(max_similar-views.get(gid, 0) for gid in groups) + unknown < len(remaining):
                     failed.add(state)
                     return None
             # Raw free time overestimates capacity when only a few windows
@@ -568,21 +642,28 @@ def _match_slots_to_video(slots, audio_items, video_info, min_gap_sec=0.0, requi
             # Stable sorting retains the original quality/exposure ordering.
             choices = sorted(available[index], key=lambda row: (
                 0 if row[3].get('character_selection', {}).get('reference_id') else 1,
-                reference_usage(row, counts, seconds))) if character_analysis_reference else available[index]
+                reference_usage(row, counts, seconds), composition_usage(row, views))) if character_analysis_reference else sorted(
+                    available[index], key=lambda row: (exposure_rank(row), composition_usage(row, views)))
             for row in choices:
                 start = row[1]
                 next_counts, next_seconds = dict(counts), dict(seconds)
                 credit_reference(row, needs[index], next_counts, next_seconds)
-                result = search(following, subtract(intervals, start-gap, start+needs[index]+gap), next_counts, next_seconds)
+                next_views = dict(views)
+                credit_composition(row, next_views)
+                result = search(following, subtract(intervals, start-gap, start+needs[index]+gap), next_counts, next_seconds, next_views)
                 if result is not None:
                     result[index] = row
                     return result
             failed.add(state)
             return None
         character_analysis_reference = bool((video_info.get('character_analysis') or {}).get('reference'))
-        allocation = search(tuple(selection_order), free, {}, {})
+        allocation = search(tuple(selection_order), free, {}, {}, {})
         if allocation is None:
             speech_note = " Visible lip movement is required; static faces are excluded." if require_lip_motion else ""
+            if video_info.get('require_clear_face'):
+                speech_note += " Readable faces are required across each cut; body-only fallback is disabled."
+            if max_similar and any(s.get('composition_id') for s in samples):
+                speech_note += f" Recurring camera compositions are limited to {max_similar} cuts; video.max_similar_cuts=0 disables this limit."
             raise InsufficientFootageError("Not enough qualifying footage with a visible person throughout: "
                 f"no verified allocation for {len(slots)} full cuts with a stable opening and a {gap:g}s source gap "
                 "after checking alternative windows. Scenery and unconfirmed pose detections "

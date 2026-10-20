@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from copy import deepcopy
 from typing import Any
 from autoedit.video.characters import DEFAULTS as CHARACTER_DEFAULTS
 
@@ -13,6 +14,12 @@ except ImportError:  # pragma: no cover
 
 
 DEFAULTS: dict[str, Any] = {
+    "ai": {"enabled": False, "backend": "gemini", "model": "gemini-3.8-flash", "api_key": "", "cache_dir": "",
+           "local_model": "qwen3-vl:2b-instruct", "local_url": "http://127.0.0.1:11435", "local_batch_frames": 12,
+           "local_device": "cpu", "local_threads": 2, "local_gpu_layers": 8,
+           "local_analysis_mode": "until_filled", "local_target_seconds": 300, "local_max_seconds": 0,
+           "video_fps": 1, "max_source_seconds": 0, "shot_fallback": True, "transition_tail_fallback_sec": 0,
+           "final_scene_transition_fallback": False, "shortage_policy": "complete"},
     "job": {"name": "job", "output_dir": "./output"},
     "premiere": {
         "project": "",
@@ -26,7 +33,11 @@ DEFAULTS: dict[str, Any] = {
     "audio": {"directory": r"D:\Editor\Voice", "glob": "*.wav", "files": [], "max_files": 0},
     "video": {
         "analysis_mode": "until_filled",
+        "verification_mode": "verified",
         "analysis_chunk_sec": 30,
+        "incremental_fps": 2,
+        "search_fps": 1,
+        "reference_discovery": "auto",
         "sample_fps": 6,
         "max_seconds": 0,
         "source_kind": "live_action",
@@ -35,13 +46,15 @@ DEFAULTS: dict[str, Any] = {
         "merge_gap_sec": 0.20,
         "backend": "auto",
         "speech_model": "small",
-        "speech_device": "auto",
+        "speech_device": "cpu",
         "speech_compute_type": "auto",
         "speech_device_index": 0,
         "speech_language": "en",
         "require_lip_motion": False,
-        "object_detection": {"enabled": "auto", "device": "auto", "threshold": .3},
-        "characters": dict(CHARACTER_DEFAULTS),
+        "require_clear_face": True,
+        "max_similar_cuts": 2,
+        "object_detection": {"enabled": "auto", "device": "cpu", "threshold": .3, "batch_size": 2, "compute_type": "auto"},
+        "characters": {**CHARACTER_DEFAULTS, "device": "cpu"},
     },
     "cubase": {
         "project": "",
@@ -56,12 +69,12 @@ DEFAULTS: dict[str, Any] = {
 
 
 def _deep_merge(base: dict, overlay: dict) -> dict:
-    out = dict(base)
+    out = deepcopy(base)
     for key, value in overlay.items():
         if isinstance(value, dict) and isinstance(out.get(key), dict):
             out[key] = _deep_merge(out[key], value)
         else:
-            out[key] = value
+            out[key] = deepcopy(value)
     return out
 
 

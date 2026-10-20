@@ -103,15 +103,15 @@ class EmbeddingModel:
             self.session = self._session(["CPUExecutionProvider"])
             return self.session.run(None, {self.input.name: tensor})
 
-    def extract(self, frame, face, frame_width, frame_height, other_faces=()):
+    def prepare(self, frame, face, frame_width, frame_height, other_faces=()):
         import cv2
         height, width = frame.shape[:2]
         sx, sy = width / frame_width, height / frame_height
         x, y, w, h = face["face"]
         x, y, w, h = x * sx, y * sy, w * sx, h * sy
-        if min(w, h) < 32:
-            return None
         if self.kind == "live_action":
+            if min(w, h) < 32:
+                return None
             points = np.asarray(face.get("face_keypoints", []), dtype=np.float32)
             if points.shape != (7, 2) or face.get("frontal_score", 0) < .35:
                 return None
@@ -130,16 +130,38 @@ class EmbeddingModel:
             if face.get('subject_kind') == 'object':
                 ox,oy,ow,oh=face['subject_box']
                 x,y,w,h=ox*sx,oy*sy,ow*sx,oh*sy
+                if min(w,h) < 32:
+                    return None
                 left,top=max(0,int(x-.08*w)),max(0,int(y-.08*h))
                 right,bottom=min(width,int(x+1.08*w)),min(height,int(y+1.08*h))
             else:
-                left, top = max(0, int(x - .35 * w)), max(0, int(y - .55 * h))
-                right, bottom = min(width, int(x + 1.35 * w)), min(height, int(y + 1.2 * h))
+                if min(w,h) < 32:
+                    return None
+                if face.get('identity_face_crop'):
+                    # Automatic actors can change hair/hood/clothing. Compare
+                    # measured facial appearance with only narrow context.
+                    left,top = max(0,int(x-.1*w)),max(0,int(y-.1*h))
+                    right,bottom = min(width,int(x+1.1*w)),min(height,int(y+1.1*h))
+                else:
+                    left, top = max(0, int(x - .35 * w)), max(0, int(y - .55 * h))
+                    right, bottom = min(width, int(x + 1.35 * w)), min(height, int(y + 1.2 * h))
             for other in other_faces:
                 if other is face:
                     continue
                 ox, oy, ow, oh = other.get('track_box',other['face'])
-                if left < (ox + ow / 2) * sx < right and top < (oy + oh / 2) * sy < bottom:
+                cx, cy = (ox + ow / 2) * sx, (oy + oh / 2) * sy
+                if face.get('subject_kind') == 'object' and left < cx < right and top < cy < bottom:
+                    # A neighbour in optional padding must not make the measured
+                    # body unreadable. Remove padding, never the detected body.
+                    if cx <= x:
+                        left = max(left, int(np.ceil(x)))
+                    elif cx >= x+w:
+                        right = min(right, int(x+w))
+                    elif cy <= y:
+                        top = max(top, int(np.ceil(y)))
+                    elif cy >= y+h:
+                        bottom = min(bottom, int(y+h))
+                if left < cx < right and top < cy < bottom:
                     return None
             crop = frame[top:bottom, left:right]
             if crop.size == 0:
@@ -151,9 +173,36 @@ class EmbeddingModel:
                 [.26862954, .26130258, .27577711], np.float32)
         else:
             rgb = (rgb - 127.5) / 127.5
-        tensor = np.ascontiguousarray(rgb.transpose(2, 0, 1)[None])
-        vector = np.asarray(self._run(tensor)[0], np.float32).reshape(-1)
+        return np.ascontiguousarray(rgb.transpose(2, 0, 1)[None])
+
+    @staticmethod
+    def _normalized(vector):
+        vector = np.asarray(vector, np.float32).reshape(-1)
         norm = float(np.linalg.norm(vector))
         if not np.isfinite(vector).all() or norm <= 1e-8:
             raise ValueError("Character embedding model returned an invalid vector.")
         return vector / norm
+
+    def extract(self, frame, face, frame_width, frame_height, other_faces=()):
+        tensor = self.prepare(frame, face, frame_width, frame_height, other_faces)
+        return None if tensor is None else self._normalized(self._run(tensor)[0])
+
+    def extract_many(self, frame, faces, frame_width, frame_height):
+        """Bounded screening batches, including support for fixed batch-one models."""
+        result = [None] * len(faces)
+        batch_size = 1 if isinstance(self.input.shape[0], int) else 4
+        pending = []
+        def flush():
+            if pending:
+                values = self._run(np.concatenate([tensor for _, tensor in pending]))[0]
+                for (index, _), vector in zip(pending, values):
+                    result[index] = self._normalized(vector)
+                pending.clear()
+        for index, face in enumerate(faces):
+            tensor = self.prepare(frame, face, frame_width, frame_height)
+            if tensor is not None:
+                pending.append((index, tensor))
+                if len(pending) == batch_size:
+                    flush()
+        flush()
+        return result

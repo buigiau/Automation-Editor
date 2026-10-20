@@ -60,7 +60,7 @@ def test_minions_profile_does_not_load_human_face_models(monkeypatch):
         detector.close()
 
 
-def test_automatic_ensemble_ranks_by_exposure_and_keeps_individual_tracks(tmp_path, monkeypatch):
+def test_automatic_cast_ranks_individuals_instead_of_species_tags(tmp_path, monkeypatch):
     import autoedit.video.characters as chars
     minion={**face([50,50,40,60]),'face_evidence':MINION_EVIDENCE,
             'character_group':'yellow_minions','backend':'animation-eyes-mouth'}
@@ -74,17 +74,18 @@ def test_automatic_ensemble_ranks_by_exposure_and_keeps_individual_tracks(tmp_pa
     def extract(video,config,*args):
         tracks=build_tracks(video['samples'],[],4,6,config)
         tag_ensemble_tracks(tracks,video['samples'])
-        for track in tracks:
-            if not track.get('character_group'):
-                track['vectors']=[[1,0],[1,0]]
+        for index, track in enumerate(tracks):
+            vector = np.eye(len(tracks),dtype=np.float32)[index].tolist()
+            track['vectors']=[vector,vector]
         return tracks
     monkeypatch.setattr(chars,'_extract_tracks',extract)
     result=analyze_characters(info,tmp_path,{'ccip_model':str(model)})
     assert all(s['character_id'] == 'character-001' for s in result['samples'])
     assert all(s['face'][2] == 40 and s['activity_score'] == .4 for s in result['samples'])
-    assert len(result['character_analysis']['clusters'][0]['track_ids']) == 2
+    assert len(result['character_analysis']['clusters'][0]['track_ids']) == 1
     assert result['character_analysis']['clusters'][0]['duration_sec'] == pytest.approx(4)
-    assert result['character_analysis']['clusters'][0]['character_group'] == 'yellow_minions'
+    assert all(not c.get('character_group') for c in result['character_analysis']['clusters'])
+    assert len(result['character_analysis']['clusters']) == 3
     assert not result['character_analysis'].get('strict_main_group')
     assert 'character_analysis' not in info
 

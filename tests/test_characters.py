@@ -406,6 +406,16 @@ def test_invalid_settings_are_rejected(config):
         settings(config)
 
 
+def test_native_frame_rounding_keeps_tracks_but_missing_samples_and_cuts_split_them():
+    from autoedit.video.characters import build_tracks, settings
+    samples = [{'time_sec': t, 'faces': [face()]} for t in (0., .52, 1., 1.52, 2.52, 3.)]
+    tracks = build_tracks(samples, [], 3.5, 2, settings(), native_fps=25)
+    assert [len(t['observations']) for t in tracks] == [4, 2]
+    samples = [{'time_sec': t, 'faces': [face()]} for t in (0., .52, 1., 1.52)]
+    tracks = build_tracks(samples, [1.], 2., 2, settings(), native_fps=25)
+    assert [len(t['observations']) for t in tracks] == [2, 2]
+
+
 def test_full_resolution_crop_extraction_with_real_video_decode(tmp_path):
     import cv2
     from autoedit.video.characters import _extract_tracks
@@ -428,6 +438,38 @@ def test_full_resolution_crop_extraction_with_real_video_decode(tmp_path):
     assert len(tracks) == 1
     assert len(tracks[0]["vectors"]) == 8
     assert set(seen) == {(96, 128, 3)}
+
+
+def test_character_crops_seek_over_gaps_and_keep_native_timestamps(tmp_path,monkeypatch):
+    import av
+    import cv2
+    from autoedit.video.characters import _selected_source_frames
+    path=tmp_path/'gaps.avi'
+    writer=cv2.VideoWriter(str(path),cv2.VideoWriter_fourcc(*'MJPG'),10,(128,96))
+    assert writer.isOpened()
+    for i in range(70):
+        writer.write(np.full((96,128,3),i*3,np.uint8))
+    writer.release()
+    original_open=av.open
+    seeks=[]
+    class Container:
+        def __init__(self):
+            self.native=original_open(str(path))
+            self.streams=self.native.streams
+        def __enter__(self):
+            return self
+        def __exit__(self,*a):
+            self.native.close()
+        def seek(self,*a,**kw):
+            seeks.append(a[0])
+            return self.native.seek(*a,**kw)
+        def decode(self,*a):
+            return self.native.decode(*a)
+    monkeypatch.setattr(av,'open',lambda *a,**kw:Container())
+    frames=list(_selected_source_frames(path,[.2,.4,6.1,6.2]))
+    assert len(seeks)==2
+    assert [time for time,frame in frames]==[.2,.4,6.1,6.2]
+    assert [round(float(frame.mean())) for time,frame in frames]==[6,12,183,186]
 
 
 def test_pipeline_runs_character_filter_and_publishes_metadata(tmp_path, monkeypatch):
@@ -462,7 +504,8 @@ def test_pipeline_runs_character_filter_and_publishes_metadata(tmp_path, monkeyp
     result = pipeline.run_pipeline({"job": {"output_dir": str(out)},
         "premiere": {"project": str(fixture_project(tmp_path)), "source_media": "source.mp4"},
         "cubase": {"project": "test.cpr"},
-        "video": {"require_lip_motion": False, "characters": {"arcface_model": str(model)}}})
+        "video": {"search_fps": 0, "require_lip_motion": False, "require_clear_face": False,
+                  "characters": {"arcface_model": str(model)}}})
     assert result["plan"]["slots"][0]["video"]["character_selection"]["decision"] == "main"
     assert references[0][0]["character_id"] == "character-001"
     assert (out / "character_analysis.json").is_file()

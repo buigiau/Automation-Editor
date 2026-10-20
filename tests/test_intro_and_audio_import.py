@@ -1,4 +1,5 @@
 from collections import Counter
+import copy
 from pathlib import Path
 import json
 from xml.etree import ElementTree as ET
@@ -81,20 +82,28 @@ def test_dense_match_excludes_cough_and_moves_voice_onset():
     assert not evidence["phoneme_sync_verified"]
 
 
-def test_archive_preserves_midi_fx_and_detects_tampering(tmp_path):
+@pytest.mark.parametrize("duplicate_name", [None, "SAMPLER TRACK 2 (D)"])
+def test_archive_preserves_midi_fx_and_detects_tampering(tmp_path, duplicate_name):
     template = Path("templates/cubase/soda_pop.xml")
     if not template.exists():
         pytest.skip("Reference track archive not installed")
     source = ET.parse(template).getroot()
+    if duplicate_name:
+        original = list(sampler_tracks(source).values())[2]
+        duplicate = copy.deepcopy(original)
+        duplicate.find("obj[@name='Node']/string[@name='Name']").set("value", duplicate_name)
+        source.find("list[@name='track']").append(duplicate)
+        template = tmp_path / "with-duplicate.xml"
+        ET.ElementTree(source).write(template, encoding="utf-8")
     names = list(sampler_tracks(source))
     wav = tmp_path / "cười.wav"
     sf.write(wav, np.zeros(48000), 48000)
     slots = [{"cubase": {"track_name": n, "sample_path": str(wav)}} for n in names]
     archive = prepare_archive(template, slots, tmp_path / "samples.xml")
     report = verify_import(template, archive, slots)
-    assert report["verified_tracks"] == 16
+    assert report["verified_tracks"] == len(names)
     root = ET.parse(archive)
-    assert len(root.getroot().find("list[@name='track']")) == 16
+    assert len(root.getroot().find("list[@name='track']")) == len(names)
     for track in sampler_tracks(root.getroot()).values():
         assert sample_field(unpack_component(component(track).text)[1])[2] == str(wav)
     note = next(n for n in root.iter("obj") if n.get("class") == "MMidiNote")

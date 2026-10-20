@@ -16,16 +16,19 @@ import numpy as np
 from autoedit.video.embeddings import EmbeddingModel, fingerprint, model_path
 from autoedit.acceleration import device_settings
 
-CHARACTER_VERSION = 8
+CHARACTER_VERSION = 16
 DEFAULTS = {
     "enabled": True, "coverage_target": .75, "min_main_fraction": .85,
     "arcface_model": "", "ccip_model": "", "arcface_cosine_distance": .35,
     "ccip_cosine_distance": .20, "max_track_gap_sec": .5,
+    "ccip_face_cosine_distance": .30,
+    "body_reference_cosine_distance": .30,
     "embeddings_per_track": 8, "min_cluster_seconds": 3.0, "min_cluster_shots": 2,
     "device": "auto", "device_index": 0,
     "main_group": "auto",
     "embedding_model": "auto",
     "reference_images": [],
+    "reference_regions": {},
 }
 
 
@@ -35,6 +38,8 @@ def settings(config=None):
     if not isinstance(references, list) or any(not isinstance(p, str) or not p.strip() for p in references):
         raise ValueError('video.characters.reference_images must be a list of image paths')
     result['reference_images'] = list(dict.fromkeys(references))
+    if not isinstance(result['reference_regions'], dict):
+        raise ValueError('video.characters.reference_regions must map image paths to selected regions')
     if references:
         result['enabled'] = True
     device_settings(result["device"], result["device_index"])
@@ -43,7 +48,7 @@ def settings(config=None):
     if result["main_group"] not in {"auto", "yellow_minions"}:
         raise ValueError("video.characters.main_group must be auto or yellow_minions")
     # Compatibility with the earlier GUI preset. Cast selection is automatic;
-    # a detected ensemble participates in exposure ranking alongside everyone.
+    # species presets no longer combine individual identities.
     result['main_group'] = 'auto'
     if result['embedding_model'] not in {'auto','arcface','ccip'}:
         raise ValueError('video.characters.embedding_model must be auto, arcface or ccip')
@@ -52,7 +57,7 @@ def settings(config=None):
         if not math.isfinite(value) or not 0 < value <= 1:
             raise ValueError(f"video.characters.{key} must be in (0, 1]")
         result[key] = value
-    for key in ("arcface_cosine_distance", "ccip_cosine_distance"):
+    for key in ("arcface_cosine_distance", "ccip_cosine_distance", "ccip_face_cosine_distance", "body_reference_cosine_distance"):
         value = float(result[key])
         if not math.isfinite(value) or not 0 < value < 1:
             raise ValueError(f"video.characters.{key} must be in (0, 1)")
@@ -85,11 +90,14 @@ def prominent_face(faces, width, height):
     return max(faces, key=score) if faces else None
 
 
-def build_tracks(samples, transitions, duration, sample_fps, config, shot_times=None):
+def build_tracks(samples, transitions, duration, sample_fps, config, shot_times=None, native_fps=0):
     """Associate one face per track per timestamp; every transition resets tracks."""
     from autoedit.video.objects import subject_family
     tracks, active = [], []
     interval = 1 / sample_fps
+    # Timestamp sampling lands on native frames (e.g. .48/.52 s at 25 fps).
+    # One native frame of rounding must not split a valid physical track.
+    slack = 1 / native_fps if native_fps and math.isfinite(native_fps) and native_fps > 0 else 0.
     previous_shot = None
     shot_times = transitions if shot_times is None else shot_times
     for index, sample in enumerate(samples):
@@ -100,7 +108,7 @@ def build_tracks(samples, transitions, duration, sample_fps, config, shot_times=
         if boundary_index != previous_shot:
             active = []
         previous_shot = boundary_index
-        active = [tid for tid in active if time - tracks[tid]["last_time"] <= config["max_track_gap_sec"]]
+        active = [tid for tid in active if time - tracks[tid]["last_time"] <= config["max_track_gap_sec"] + slack + 1e-8]
         faces = sample.get("faces", [])
         candidates = []
         nested_links = set()
@@ -180,7 +188,7 @@ def exposure(intervals):
 
 
 def _selected_source_frames(path, times):
-    """Second sequential decode; materialize only requested full-resolution frames."""
+    """Decode requested full-resolution frames, seeking over distant regions."""
     import av
     position = 0
     if not times:
@@ -188,20 +196,31 @@ def _selected_source_frames(path, times):
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
-        stream.codec_context.thread_count = 4
+        stream.codec_context.thread_count = 2
         origin = float(stream.start_time * stream.time_base) if stream.start_time is not None else 0
-        fps = float(stream.average_rate or 25)
-        container.seek(int((times[0] + origin) / float(stream.time_base)), stream=stream, backward=True)
-        for index, frame in enumerate(container.decode(stream)):
-            time = float(frame.time) - origin if frame.time is not None else index / fps
-            if position >= len(times):
+        decoded = None
+        last_time = None
+        for target in times:
+            from autoedit.runtime import check_cancelled
+            check_cancelled()
+            if last_time is None or target - last_time > 2:
+                container.seek(int((target + origin) / float(stream.time_base)), stream=stream, backward=True)
+                decoded = iter(container.decode(stream))
+            for frame in decoded:
+                check_cancelled()
+                if frame.time is None:
+                    raise RuntimeError('Character crop frame has no timestamp')
+                time = float(frame.time) - origin
+                if time < target - 1e-5:
+                    continue
+                if abs(time - target) > 1e-4:
+                    raise RuntimeError(f"Could not recover character crop frame at {target:.3f}s")
+                yield target, frame.to_ndarray(format="bgr24")
+                last_time = time
+                position += 1
                 break
-            if time < times[position] - 1e-5:
-                continue
-            if abs(time - times[position]) > 1e-4:
-                raise RuntimeError(f"Could not recover character crop frame at {times[position]:.3f}s")
-            yield times[position], frame.to_ndarray(format="bgr24")
-            position += 1
+            else:
+                break
     if position != len(times):
         raise RuntimeError("Video decode ended before all character crops were extracted")
 
@@ -211,24 +230,39 @@ def _extract_tracks(info, config, model, progress):
     transitions = sorted(set(info.get("transition_times_sec") or []))
     duration = float(info.get("analyzed_seconds") or info["duration_sec"])
     tracks = build_tracks(samples, info.get("shot_times_sec", transitions), duration, float(info["sample_fps"]), config,
-                          info.get("shot_times_sec"))
-    tag_ensemble_tracks(tracks, samples)
+                          info.get("shot_times_sec"), native_fps=float(info.get('fps') or 0))
+    if not config.get('reference_images') and getattr(model,'kind',None) == 'animation':
+        from autoedit.match.matcher import _has_face
+        for track in tracks:
+            if sum(_has_face(samples[si]['faces'][fi]) for si,fi in track['observations']) >= 2:
+                # Costume-sensitive object labels cannot split the identity of
+                # an actor with independently measured facial appearance.
+                track['subject_family'] = None
+    # Rank individual actors, not a geometric detector's species/style tags.
     requests = defaultdict(list)
     crop_cache = config.get('_crop_cache')
     vectors_by_key = {}
     selected_keys = defaultdict(list)
+    reference_face_keys = defaultdict(list)
     def crop_key(si, fi):
         sample = samples[si]
         face = sample['faces'][fi]
         fields = ('face', 'face_keypoints', 'frontal_score', 'subject_kind', 'subject_box')
         value = [sample['time_sec'], sample['frame_width'], sample['frame_height'],
+                 not bool(config.get('reference_images')) and getattr(model,'kind',None) == 'animation',
                  {k:face.get(k) for k in fields},
                  [other.get('track_box', other.get('face')) for i,other in enumerate(sample['faces']) if i != fi]]
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
     for track in tracks:
-        if track.get('character_group') and not config.get('reference_images'):
-            continue
         observations = track["observations"]
+        if not config.get('reference_images') and getattr(model,'kind',None) == 'animation':
+            from autoedit.match.matcher import _has_face
+            facial = [(si,fi) for si,fi in observations if _has_face(samples[si]['faces'][fi])]
+            if len(facial) >= 2:
+                # The track still counts its full measured body exposure, but
+                # identity must not mix face features with costume/body crops.
+                observations = facial
+                track['identity_region'] = 'measured-face'
         # Spread representatives through the track, picking the clearest in each bucket.
         for bucket in np.array_split(np.arange(len(observations)), min(config["embeddings_per_track"], len(observations))):
             choices = [observations[int(i)] for i in bucket]
@@ -241,6 +275,15 @@ def _extract_tracks(info, config, model, progress):
                 vectors_by_key[key] = crop_cache[key]
             else:
                 requests[samples[si]["time_sec"]].append((track, si, fi))
+            subject = samples[si]['faces'][fi]
+            if (config.get('reference_images') and getattr(model, 'kind', None) == 'animation'
+                    and subject.get('subject_kind') == 'object' and subject.get('face_detected')):
+                face_key = key + ':face'
+                reference_face_keys[track['id']].append(face_key)
+                if crop_cache is not None and face_key in crop_cache:
+                    vectors_by_key[face_key] = crop_cache[face_key]
+                elif not any(t is track and s == si and f == fi for t,s,f in requests[samples[si]['time_sec']]):
+                    requests[samples[si]['time_sec']].append((track,si,fi))
     if progress:
         progress(f"Character crops: {len(tracks)} shot-local tracks; {len(requests)} full-resolution frames")
     frames = _selected_source_frames(info["path"], sorted(requests))
@@ -249,11 +292,29 @@ def _extract_tracks(info, config, model, progress):
         for time, frame in frames:
             for track, si, fi in requests[time]:
                 sample = samples[si]
-                vector = model.extract(frame, sample["faces"][fi], sample["frame_width"],
-                                       sample["frame_height"], sample["faces"])
-                vectors_by_key[crop_key(si, fi)] = vector.tolist() if vector is not None else None
-                if crop_cache is not None:
-                    crop_cache[crop_key(si, fi)] = vector.tolist() if vector is not None else None
+                key = crop_key(si,fi)
+                if key not in vectors_by_key:
+                    subject = sample['faces'][fi]
+                    others = sample['faces']
+                    if (not config.get('reference_images') and getattr(model,'kind',None) == 'animation'
+                            and subject.get('face_detected')):
+                        # Keep automatic identity cues consistent between a
+                        # close-up and an independently detected full actor.
+                        subject = {**subject,'subject_kind':'face','identity_face_crop':True}
+                        others = [subject if i == fi else other for i,other in enumerate(others)]
+                    vector = model.extract(frame, subject, sample["frame_width"],
+                                           sample["frame_height"], others)
+                    vectors_by_key[key] = vector.tolist() if vector is not None else None
+                    if crop_cache is not None:
+                        crop_cache[key] = vectors_by_key[key]
+                face_key = crop_key(si,fi) + ':face'
+                if face_key in reference_face_keys[track['id']] and face_key not in vectors_by_key:
+                    subject = {**sample['faces'][fi], 'subject_kind':'face'}
+                    others = [subject if i == fi else other for i,other in enumerate(sample['faces'])]
+                    vector = model.extract(frame,subject,sample['frame_width'],sample['frame_height'],others)
+                    vectors_by_key[face_key] = vector.tolist() if vector is not None else None
+                    if crop_cache is not None:
+                        crop_cache[face_key] = vectors_by_key[face_key]
             count += 1
             if progress and count % 100 == 0:
                 progress(f"Character embeddings: {count}/{len(requests)} crop frames")
@@ -262,29 +323,33 @@ def _extract_tracks(info, config, model, progress):
     for track in tracks:
         track['vectors'] = [vectors_by_key[key] for key in selected_keys[track['id']]
                             if vectors_by_key[key] is not None]
+        if reference_face_keys[track['id']]:
+            track['reference_face_vectors'] = [vectors_by_key[key] for key in reference_face_keys[track['id']]
+                                              if vectors_by_key[key] is not None]
         track.pop("last_box", None)
         track.pop("last_time", None)
     return tracks
 
 
-def cluster_tracks(tracks, threshold):
+def cluster_tracks(tracks, threshold, face_threshold=None):
     """Complete-link agglomeration; co-visible separate tracks cannot merge."""
     valid, vectors = [], []
     for track in tracks:
+        limit = face_threshold if face_threshold is not None and track.get('identity_region') == 'measured-face' else threshold
         track["identity_status"] = "unknown"
         features = np.asarray(track["vectors"], dtype=np.float32)
         if len(features) < 2:
             continue
         similarities = features @ features.T
         medoid = int(np.argmax(similarities.mean(axis=1)))
-        consistent = features[1 - similarities[medoid] <= threshold]
+        consistent = features[1 - similarities[medoid] <= limit]
         if len(consistent) < 2 or len(consistent) / len(features) < .75:
             track["identity_status"] = "noise"
             continue
         centroid = consistent.mean(axis=0)
         centroid /= np.linalg.norm(centroid)
         track["identity_status"] = "clustered"
-        track["identity_confidence"] = float(np.clip(1 - np.max(1 - consistent @ centroid) / threshold, 0, 1))
+        track["identity_confidence"] = float(np.clip(1 - np.max(1 - consistent @ centroid) / limit, 0, 1))
         if len(consistent) != len(features):
             track["identity_confidence"] = min(.4, track["identity_confidence"])
         valid.append(track)
@@ -299,6 +364,9 @@ def cluster_tracks(tracks, threshold):
     for i in range(len(valid)):
         distances[i, i] = np.inf
         for j in range(i):
+            if face_threshold is not None and all(t.get('identity_region') == 'measured-face' for t in (valid[i],valid[j])):
+                # Normalize pair-specific limits for complete-link clustering.
+                distances[i,j] = distances[j,i] = distances[i,j]*threshold/face_threshold
             conflicting_type = (valid[i].get('subject_family') and valid[j].get('subject_family')
                                 and valid[i]['subject_family'] != valid[j]['subject_family'])
             if observations[i] & observations[j] or conflicting_type:
@@ -413,7 +481,8 @@ def rank_characters(tracks, config, threshold, appearance_samples=None):
         if track.get('group_evidence') in APPEARANCE_GROUP_EVIDENCE:
             track.pop('character_group',None)
             track.pop('group_evidence',None)
-    groups = cluster_tracks([track for track in tracks if not track.get('character_group')], threshold)
+    groups = cluster_tracks([track for track in tracks if not track.get('character_group')], threshold,
+                            config.get('ccip_face_cosine_distance'))
     if appearance_samples is not None:
         groups = appearance_ensembles(groups,appearance_samples)
     ensembles = defaultdict(list)
@@ -442,6 +511,27 @@ def rank_characters(tracks, config, threshold, appearance_samples=None):
     return clusters, by_track, (covered / total if total else 0)
 
 
+def rank_individual_characters(tracks, config, threshold, samples=None):
+    for track in tracks:
+        track.pop('character_group', None)
+        track.pop('group_evidence', None)
+    clusters, by_track, achieved = rank_characters(tracks, config, threshold)
+    if config.get('_require_actor_face') and samples is not None:
+        from autoedit.match.matcher import _has_face
+        eligible = set()
+        for cluster in clusters:
+            observations = [(si,fi) for track in tracks if track['id'] in cluster['track_ids']
+                            for si,fi in track['observations']]
+            if sum(_has_face(samples[si]['faces'][fi]) for si,fi in observations) >= 2:
+                eligible.update(cluster['track_ids'])
+        for track in tracks:
+            if track['id'] not in eligible:
+                track.update(identity_status='unknown', identity_confidence=0.)
+        clusters, by_track, achieved = rank_characters(
+            [track for track in tracks if track['id'] in eligible], config, threshold)
+    return clusters, by_track, achieved
+
+
 def _embedding_tracks(info, cache_dir, config, kind, progress):
     path = model_path(kind, config)
     runtime = config.get('_runtime_cache')
@@ -459,6 +549,7 @@ def _embedding_tracks(info, cache_dir, config, kind, progress):
                 'analyzed_seconds':info.get('analyzed_seconds',info['duration_sec']),
                 'sample_count':len(info['samples'])}
     identity['extract_ensemble_features'] = bool(config.get('reference_images'))
+    identity['native_fps'] = info.get('fps')  # Invalidate tracks built without timestamp rounding tolerance.
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     cache = Path(cache_dir) / f"characters-{key}.json.gz"
     tracks = None
@@ -517,15 +608,19 @@ def analyze_characters(video_info, cache_dir, config=None, progress=None, runtim
     source_kind = video_info.get('source_kind','live_action')
     kind = {'arcface':'live_action','ccip':'animation'}.get(config['embedding_model'],source_kind)
     object_regions=any(f.get('subject_kind')=='object' for s in video_info['samples'] for f in s['faces'])
+    if any(region.get('kind') == 'body' for regions in config.get('reference_regions', {}).values() for region in regions):
+        object_regions = True
     if config['embedding_model']=='auto' and object_regions:
         kind='animation'
         if progress:
             progress('Whole-character regions: using CCIP appearance features independently of face landmarks')
     info = deepcopy(video_info)
+    from autoedit.video.subjects import exclude_screen_overlays, SUBJECT_FILTER_VERSION
+    if (info.get('subject_filter') or {}).get('version') != SUBJECT_FILTER_VERSION:
+        exclude_screen_overlays(info, progress)
     tracks,execution,identity,path = _embedding_tracks(info,cache_dir,config,kind,progress)
     threshold = config["ccip_cosine_distance" if kind == "animation" else "arcface_cosine_distance"]
-    clusters, by_track, achieved = rank_characters(tracks, config, threshold,
-        appearance_samples=info['samples'] if kind == 'animation' else None)
+    clusters, by_track, achieved = rank_individual_characters(tracks, config, threshold, info['samples'])
     auto_decision = None
     # Human face features can fragment stylised/CGI actors across expressions.
     # Choose the appearance model only when its measured track consistency
@@ -536,12 +631,11 @@ def analyze_characters(video_info, cache_dir, config=None, progress=None, runtim
         from autoedit.video.embeddings import MODEL_ROOT
         appearance_path = Path(config.get('ccip_model') or MODEL_ROOT/'ccip.onnx')
         if appearance_path.is_file():
-            trial = deepcopy(video_info)
+            trial = deepcopy(info)
             alternate = _embedding_tracks(trial,cache_dir,config,'animation',progress)
             trial_tracks,trial_execution,trial_identity,trial_path = alternate
             trial_threshold = config['ccip_cosine_distance']
-            trial_clusters,trial_by_track,trial_achieved = rank_characters(trial_tracks,config,trial_threshold,
-                appearance_samples=trial['samples'])
+            trial_clusters,trial_by_track,trial_achieved = rank_individual_characters(trial_tracks,config,trial_threshold,trial['samples'])
             trial_uncertain = sum(t['identity_status'] in {'unknown','noise'} for t in trial_tracks)
             if trial_tracks and trial_uncertain/len(trial_tracks) <= uncertain/len(tracks)-.1:
                 auto_decision = {'reason':'appearance-model-improves-track-consistency',
@@ -579,15 +673,16 @@ def analyze_characters(video_info, cache_dir, config=None, progress=None, runtim
                             reference_template_id=track.get('reference_template_id'),
                             reference_ambiguous=track.get('reference_ambiguous', False))
     _annotate_subjects(info, source_kind)
-    info["character_analysis"] = {"version": CHARACTER_VERSION, "selection_policy":"exposure-ranked-cast",
+    info["character_analysis"] = {"version": CHARACTER_VERSION, "selection_policy":"individual-exposure-ranked-cast",
         "model_sha256": identity["model_sha256"],
         "execution": execution,
         "model_path": str(path), "embedding_model": "ccip" if kind == "animation" else "arcface",
         'requested_embedding_model':config['embedding_model'],'auto_decision':auto_decision,
         "clustering": "complete-link-cosine-with-cooccurrence-constraints", "cosine_distance": threshold,
+        'face_cosine_distance':config['ccip_face_cosine_distance'] if kind == 'animation' and not config['reference_images'] else None,
         "coverage_target": config["coverage_target"], "coverage_achieved": achieved,
         "min_main_fraction": config["min_main_fraction"], "clusters": clusters,
-        "tracks": [{k: v for k, v in track.items() if k != "vectors"} for track in tracks]}
+        "tracks": [{k: v for k, v in track.items() if k not in ("vectors", "reference_face_vectors")} for track in tracks]}
     if reference_info:
         info['character_analysis']['reference'] = reference_info
     if progress:
@@ -612,6 +707,8 @@ def _annotate_subjects(info, kind):
         face.update(clear_face=measured["clear_face"], speaking=measured["speaking"])
     for sample in info["samples"]:
         faces = sample["faces"]
+        from autoedit.video.subjects import reset_selected_subject
+        reset_selected_subject(sample)
         # Exposure rank precedes speech/size. The matcher also evaluates every
         # separate face track when strict speech needs another visible actor.
         def priority(face):
@@ -625,6 +722,7 @@ def _annotate_subjects(info, kind):
             # Preserve motion measured on the complete frame.
             sample.update({k:v for k,v in selected.items() if k not in {"activity_score", "mouth_activity"}})
             sample["face_visible"] = float(bool(selected.get('face_detected')))
+            sample['readable_face'] = selected.get('readable_face', selected.get('clear_face', 0.))
         else:
             sample.update(character_status="unknown", character_id=None, character_rank=None, identity_confidence=0)
             sample.update(reference_match=False, reference_id=None, reference_confidence=0.)

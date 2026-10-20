@@ -161,7 +161,7 @@ def test_animation_pipeline_prioritizes_source_word_then_neutral(tmp_path, monke
     result = pipeline.run_pipeline({"job": {"output_dir": str(tmp_path / "out")},
         "cubase": {"project": "test.cpr"},
         "premiere": {"project": str(fixture_project(tmp_path)), "source_media": "source.mp4"},
-        "video": {"source_kind": "animation", "require_lip_motion": False,
+        "video": {"search_fps": 0, "source_kind": "animation", "require_lip_motion": False, "require_clear_face": False,
                   "characters": {"enabled": False}}})
     plan = result["plan"]
     assert len(plan["slots"]) == 1

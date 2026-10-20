@@ -5,7 +5,7 @@ import math
 TIME_KEYS = {"time_sec", "start_sec", "end_sec", "in_sec", "out_sec", "start", "end",
              "source_word_start_sec", "source_word_end_sec", "feature_anchor_sec",
              "visual_onset_sec", "suggested_cut_in_sec"}
-ID_KEYS = {"track_id", "character_id", "shot_id", "subject_track_id"}
+ID_KEYS = {"track_id", "character_id", "shot_id", "subject_track_id", "composition_id"}
 
 
 def bounded_segments(segments, end_sec, min_sec=0.0):
@@ -45,6 +45,9 @@ def combine_video_infos(infos, gap):
         return {**info, "segments": bounded_segments(info.get("segments", []), duration)}
     pool = {**infos[0], "samples": [], "segments": [], "transition_times_sec": [],
             "shot_times_sec": [], "source_spans": [], "backend_counts": {}}
+    ranged = any('verified_ranges' in info for info in infos)
+    if ranged:
+        pool['verified_ranges'] = []
     # The separator keeps source-gap reservations within the originating file.
     separator = max(1.0, float(gap) + 1.0)
     offset = 0.0
@@ -56,6 +59,9 @@ def combine_video_infos(infos, gap):
         pool["source_spans"].append({"path": info["path"], "offset_sec": offset,
                                      "end_sec": offset + duration,
                                      "duration_sec": info["duration_sec"], "analyzed_seconds": duration})
+        if ranged:
+            pool['verified_ranges'].extend([a+offset,b+offset] for a,b in
+                info.get('verified_ranges', [[0., duration]]))
         pool["samples"].extend(shift_times([s for s in info.get("samples", [])
             if s['time_sec'] < duration], offset, f"source-{index}"))
         pool["segments"].extend(shift_times(
@@ -94,6 +100,9 @@ def combine_video_infos(infos, gap):
 
 
 def span_for_cut(pool, cut):
+    if 'verified_ranges' in pool and not any(a-1e-8 <= cut['in_sec'] and cut['out_sec'] <= b+1e-8
+                                           for a,b in pool['verified_ranges']):
+        raise ValueError('Selected cut crosses unverified footage')
     for span in pool.get("source_spans", []):
         if span["offset_sec"]-1e-8 <= cut["in_sec"] and cut["out_sec"] <= span["end_sec"]+1e-8:
             return span

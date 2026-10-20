@@ -1,18 +1,125 @@
 # Automation-Editor
 
+The default GUI now opens the **Preset + AI** workflow: choose Soda Pop,
+Golden or Cosita, an output folder and source videos, with optional character
+images. Set template pairs, Voice and the AI backend once in **Thiết lập**.
+Use `AutoEdit-Local.cmd` for Qwen3-VL 4B Instruct locally without an API key,
+or select Gemini and save its key. Local Voice estimates require playback review.
+Local defaults to 2 CPU threads; GPU requires an explicit choice in settings.
+AI shortages now default to a complete draft: preserve validated cuts and fill
+remaining slots with explicitly marked footage for review. This also handles local
+inference timeouts; `ai.shortage_policy: strict` restores failure on missing scenes.
+See [AI workflow, review and cache](docs/AI_WORKFLOW.md) for setup and usage.
+`autoedit gui --legacy` opens the previous local-analysis GUI described below.
+
+See [performance changes and measured limits](docs/PERFORMANCE.md) for the
+latest speed work and verification results.
+
+Run `AutoEdit-CPU.cmd` for the CPU configuration. Speech and character models
+default to CPU. GUI analysis workers limit compute threads and use below-normal
+priority. Restart the GUI after changing `config.yaml` so it loads these settings.
+
+Use **Fast export; review faces, lips and voice afterward** (or
+`video.verification_mode: review`) to export the complete allocation before
+dense face/lip/onset checks. Character exposure ranking and source gaps remain
+active. This mode uses up to four identity images per track and transcribes
+only the selected source ranges. Every scene and voice is marked for manual
+review; `verification_mode: verified` restores the dense verification gate.
+
+## Candidate search and queued jobs
+
+The GUI and CLI now share an OS job lock. A second project waits automatically
+before loading analysis models or touching its run outputs. A crashed process
+releases the lock. **Cancel** removes a queued job or stops an active job; closing
+the GUI also cancels its active analysis. Completed frame batches and analysis
+regions remain cached for the next run. Cancel does not create a partial edit plan.
+
+In verified mode, for imported character references, `until_filled` first discovers candidate character regions at
+`video.search_fps: 1`. It verifies only candidate regions at the configured
+`sample_fps` (normally 6), and stops after a complete allocation, intro and the
+existing mouth/audio checks pass. Sparse observations never qualify a cut.
+If necessary, search adds 2 fps observations, then verifies the remaining footage
+densely before enabling exposure-ranked reference fallback. There is no automatic
+10-minute cutoff. `video.search_fps: 0` restores the legacy dense prefix search;
+`analysis_mode: full` still analyzes all selected sources. Automatic cast selection
+now honors `until_filled`: it ranks the footage analyzed so far in 30-second
+increments at `video.incremental_fps: 2` and stops when a complete allocation
+meets the chosen verification policy. Choose `full` when cast exposure must cover every source.
+
+Explicit body reference crops use tiled image embeddings for discovery and
+dense reference verification. Localized whole-character crops use
+`body_reference_cosine_distance: 0.30`. Tiles use the stricter original-image
+identity limit (`ccip_cosine_distance: 0.20`); the looser discovery limit and
+alternate views cannot certify a cut. The first pass prefers sustained sparse hits and defers isolated
+flashes. Promising clip-sized regions are checked at the
+configured full sample rate, with per-frame identity evidence and the existing
+transition checks. Image tiles identify the imported target; they do not supply
+face landmarks or lip motion. Body-only visual verification skips the face/pose
+models while retaining native-frame transition detection. Mandatory lip mode
+keeps the face/object path.
+`video.reference_discovery: objects` retains object-based discovery and verification
+for comparison; face references also keep that path. Weaker positions remain
+available in later passes and dense exhaustion.
+
+Confirmed body views can guide discovery of another angle, bounded by the original
+reference and model fingerprint. Adapted matches cannot grow this gallery or
+relax dense tile identity checks.
+Earlier dense features are reconsidered only when confirmed views change.
+If the reference search is exhausted, independent whole-cast detection runs
+before exposure-ranked fallback.
+
+Reference jobs use one detector query per verification region. Each new region is enriched
+once; expanding the search reuses its identities instead of recomputing the whole
+searched prefix. Exposure ranking is recomputed across all searched regions only
+if reference fallback becomes necessary. Selected input crops can supply a shorter
+first-pass query; unclear crops and later discovery passes retain the broad query.
+
+The detector defaults to batch 2, a 64 MiB frame cache and two CPU threads.
+`compute_type: auto` uses FP16 on CUDA and FP32 on CPU. Set `float32` explicitly
+to retain that precision. GPU memory pressure still reduces the batch size.
+Its weights are released between inference stages instead of being moved into
+host RAM. Request IDs and explicit success/error states prevent a failed worker
+from reading an older result; each completed detector batch is checkpointed.
+
+`performance.json` separates processing time from queue wait and reports sampled
+system RAM pressure. Detector metadata reports its peak allocated/reserved VRAM.
+`video_analysis_meta.analyzed_sources` includes `verified_ranges`,
+`verified_seconds`, `searched_until_sec` and `dense_region_count`; the last
+searched timestamp does not imply all earlier footage was verified densely.
+
+Compare actual project completion and cache reuse with:
+
+```powershell
+.\.venv-gpu\Scripts\python.exe scripts/benchmark_pipeline.py --config soda.yaml --config golden.yaml --modes until_filled legacy --repeats 2 --concurrent
+```
+
+The two projects start together and analysis queues automatically. Reports include
+queue wait, processing time, memory and completed slot counts. Run with recovered
+original source/reference files to reproduce an earlier job. Unit tests and short
+GPU smoke checks do not establish a sub-10-minute completion time or character
+recognition accuracy on a full project.
+
 ## Optional character references and articulation checks
 
 In the GUI, use **Target characters (optional) > Import images** to choose
 portraits of different characters, alternate views, or a thumbnail with multiple
-characters; **Clear** restores automatic exposure ranking.
+characters. **Review / crop** shows detected face suggestions and lets you drag
+a separate box around each desired face or whole character, including an animated
+vehicle. Click a box to remove it. **Clear** restores automatic exposure ranking.
 The CLI accepts repeated `--character-reference actor-a.png --character-reference group.jpg`,
 or set `video.characters.reference_images` in YAML. Human references need a
 readable face. Each detected face in a group image gets its own identity template;
 strongly matching alternate views across images are merged conservatively, but
 co-visible faces remain separate. Unreadable detected regions are reported;
 an image with no usable identity fails validation. A cartoon image with no
-detected faces is treated as one cropped character, so use individual crops
-if the group detector misses faces. References and video use the same identity model and preprocessing.
+isolated face requires an explicitly selected character region; a group image is
+never silently embedded as one identity. YAML can set `video.characters.reference_regions`
+as a mapping from each image path to a list of `{box: [x, y, width, height], kind: body}`
+or `kind: face` regions in original image pixels. Head references are compared with
+head features, and whole-character references with body features, using the same
+identity model and preprocessing. With imported references, detector labels such
+as vehicle, robot, toy or prop do not exclude a target. Such detections remain
+provisional until multiple consistent observations match the selected reference.
 Multiple consistent track observations are required; one similar frame or a
 lookalike ensemble does not establish a reference match. Evidence must consistently
 match one target; switching between imported characters cannot qualify a track.
@@ -59,22 +166,24 @@ video results and `performance.json` before claiming an accuracy or speed gain.
 
 ## Stop when enough scenes are verified
 
-The default `video.analysis_mode: until_filled` analyzes the beginning of each
-source in 30-second increments, at the existing sample rate. After each increment
+`video.analysis_mode: until_filled` searches each source in 30-second
+increments, then densely checks promising regions. After each verified region
 it tries to fill every unique Premiere slot and any empty intro, then verifies
 the selected mouths and prepares the scene/sample mapping. It stops source
 analysis as soon as a complete allocation passes those checks. Repeated instances
 of a nested sequence do not require additional source cuts.
 
-Cast exposure is ranked within the footage analyzed so far. It does not claim
-to identify the most frequent character in the unseen remainder. In the GUI,
-choose **Stop when all slots are verified** or **Analyze all sources**. YAML can
-set `video.analysis_mode: full` for whole-source ranking; `video.analysis_chunk_sec`
-controls the interval (default 30). CLI accepts `--analysis-mode full` and
-`--analysis-chunk-sec 30` on `autoedit run`.
+Automatic cast selection ranks individual characters in the analyzed footage;
+`full` ranks after scanning all sources up to `video.max_seconds`. Co-visible lookalikes and
+geometric species tags are not pooled into one identity. Measured screen overlays,
+independently detected props and uncorroborated cartoon face hypotheses are removed
+before ranking. When clear faces are required, a cast identity needs repeated face
+observations; body-only detections cannot promote furniture into the cast. With
+references, early stopping still ranks only the analyzed footage. CLI accepts
+`--analysis-mode full` and `--analysis-chunk-sec 30` on `autoedit run`.
 
-The scanner retains face/pose/tracking and transition state between increments.
-One second of measured context protects their boundaries. Failed dense mouth
+Each dense region retains face/pose/tracking and transition state while decoding.
+One second of measured context protects its boundaries. Failed dense mouth
 checks exclude those cuts and continue searching. The slot lengths, source gaps,
 person/prop checks, transition rules and strict speaking-mouth policy still apply.
 If all selected sources or `video.max_seconds` are exhausted, the run fails rather
@@ -85,9 +194,10 @@ Completed analysis checkpoints, per-frame object detections, per-crop embeddings
 audio windows and individual dense cut checks are cached. A resumed analysis
 warms detector/tracker state over the last second, then processes new frames.
 The isolated object worker reuses weights and decoded frames between actor and
-context queries. It selects CPU/CUDA and a batch size using available VRAM,
-reduces the batch on memory errors and reports the actual runtime. CUDA weights
-are offloaded between object scans so character/Whisper models can use the GPU.
+context queries. It selects CPU/CUDA, defaults to batch 1 (explicit `auto` uses
+available VRAM), reduces larger batches on memory errors and reports the actual
+runtime. Detector weights are released between stages so character/Whisper models
+can use the GPU without copying the detector into host RAM.
 Object `compute_type: float16` is opt-in pending real-video quality review;
 float32 remains the default. Changing GPU alone does not establish accuracy.
 
@@ -154,15 +264,38 @@ cannot replace it. Visual fallback cuts may match their first sound within
 250 ms of the cut. Mid-word cuts and unsupported openings use measured mouth
 shapes and timing, marked for review. Each scene has one WAV, including later reprises.
 
-The default selects clear character shots (`video.require_lip_motion: false`),
-including closeups and independently confirmed body shots. Unreadable mouths
-do not discard otherwise eligible footage; uncertain audio matches need review.
+The default requires readable faces (`video.require_clear_face: true`) while
+`video.require_lip_motion: false` permits silent faces and unreadable lips. Facial
+sharpness/size is measured separately from mouth clarity. At least 85% of each
+cut must have a readable face, with face evidence at both brackets; final cuts
+are checked again densely. A failed face check reselects footage with the same
+durations and source gaps. Insufficient qualifying footage fails the job instead
+of filling with body-only scenes. Explicitly disable **Require clear faces** or set
+`video.require_clear_face: false` to permit body shots, including body-only reference
+targets. Uncertain audio matches still need review.
+Recurring camera compositions are measured from spatial image colour structure,
+independently of actor identity and source time. `video.max_similar_cuts: 2`
+limits each similar view to two cuts, including distant returns to the same
+wide shot. Within that limit, exposure-ranked actors retain priority. When
+primary views cannot fill the timeline, qualifying supporting views are used;
+the limit also applies during alternative allocation and dense reselection.
+Set the value to `0` to disable it. A source with too few distinct eligible
+views fails allocation instead of silently repeating the same composition.
+Central promotional text widgets corroborated by a localized panel are excluded;
+ordinary subtitles and corner channel logos do not trigger this content filter.
+Ambiguous costumes can receive a separate person query: an independently localized
+face must sit in the confirmed person's head region. Body boxes alone never
+establish faces, and localized printed props remain excluded.
 The GUI's **Require speaking mouths** checkbox enables strict lip selection.
 In that mode the opening must show speech and mouth shapes must change within
 the selected cut, above pixel noise; a static open mouth or camera pan cannot qualify.
 Animation analysis adds paired eyes/pupils, shared face colour and a mouth detector
-for flat coloured cartoons, alongside MediaPipe. Unsupported styles still require
-landmarks; scenery and character embeddings alone never establish a face. Both
+for flat coloured cartoons, alongside MediaPipe. With the installed object model,
+an independent tight face query also measures stylised faces missed by human
+landmarks. Broad cartoon/body boxes cannot supply face evidence. Prop and screen
+overlay checks apply to these faces, and selected cuts repeat the face query densely
+against the selected actor. Face localizations never supply mouth geometry or speech.
+Scenery and character embeddings alone never establish a face. Both
 source types search overlapping face regions. Brief detection misses may use
 reversible, distributed face feature tracks for up to one second after a measured
 face; these tracks establish visibility, never mouth geometry or speech. Tracking
@@ -227,6 +360,19 @@ YAML: set `cubase.sampler_tracks: "2-13"` (a list such as `[2, 3, 4]` also works
 An empty string restores the default mapping. Regenerate the plan after
 changing the sampler selection.
 
+For the Dame Tu Cosita pair (`DAMTUCOSITA flip_3.prproj` and
+`DAME TU COSITA new.cpr`), enter `2-15`. The 14 numbered tracks map to the
+14 distinct Premiere nests. The later nest `3` run maps to
+`SAMPLER TRACK 2 (D)` and reuses the sample chosen for nest `3` on
+`SAMPLER TRACK 4`; nest `14` maps to `SAMPLER TRACK 15`. The `(D)` label's
+number does not override Premiere UID identity. This extra case applies only
+to an explicit range when native CPR track order, numbered tracks and `(D)`
+companions exactly match first appearances and reprises. Blank selections and
+ordinary one-track-per-run mappings retain their existing behavior. Before
+**Import Cubase**, select tracks `2-15` **and** `SAMPLER TRACK 2 (D)`;
+the generated import instructions list all required tracks. MIDI and effects
+remain under the existing verified import workflow.
+
 ## Optional NVIDIA acceleration
 
 Whisper and character embeddings default to `auto`: use CUDA when available,
@@ -236,10 +382,10 @@ Set `video.speech_device`, `video.speech_compute_type`, `video.speech_device_ind
 and `video.characters.device` / `device_index` in `config.yaml`.
 
 Character selection is automatic. For animation, one/two-eye Minion detection
-runs alongside cartoon geometry and MediaPipe. Verified yellow Minions form one
-ensemble with separate face tracks; concurrent members count once toward its
-observed screen time. The ensemble and other identities are ranked together by
-exposure, without forcing Minions first. Cuts prefer the highest ranked eligible
+runs alongside cartoon geometry and MediaPipe. Individual identities are ranked
+by observed exposure across the configured source scan. Species/style tags and
+co-visible lookalikes cannot merge different actors into one identity.
+Cuts prefer the highest ranked eligible
 actor before camera quality and sound bonuses. Recognized primary views retain
 that preference when identity needs review; lower ranked actors and unidentified
 views provide fallback. All duration, gap, transition and
@@ -251,13 +397,20 @@ With `video.characters.embedding_model: auto`, stylised actors in live-action
 sources also try the installed CCIP model when ArcFace leaves at least 45% of
 tracks uncertain. CCIP is selected only if its uncertainty improves by at least
 10 percentage points. Explicit `arcface` / `ccip` settings keep that model.
-Strongly matching CCIP appearances repeatedly seen as separate faces in the
-same frames can form an ensemble. Their physical tracks stay separate and
-simultaneous copies count once toward exposure. Subject selection and cut
+Automatic CCIP identity features use measured faces with narrow context, consistently
+across close-ups and full-body detections. Face-verified tracks use facial observations
+for their identity while retaining their full independently measured exposure.
+Costume-dependent object labels cannot split a measured facial identity.
+`video.characters.ccip_face_cosine_distance` controls automatic face comparison;
+co-visible actors remain separate. Explicit
+whole-character reference crops retain body comparison. Subject selection and cut
 ranking prefer exposure rank before speech, face size and sound bonuses.
 Feature tracking checks the intermediate decoded frames to bridge short
 landmark misses; every step needs reversible matching image features and cuts
 reset it. Tracked visibility never supplies unmeasured lips or speech.
+With independent object analysis, an unmatched tracked/geometric face cannot
+establish an actor. Localized posters and partially overlapping printed faces are
+excluded, including a tracked box that drifts beyond the poster edge.
 
 Whole-character recognition can additionally detect visible heads, bodies and
 creatures without requiring human facial landmarks. Install the official
@@ -298,8 +451,8 @@ skeleton, monster, animal, character). Other query results never establish an
 actor. Changing the prompt invalidates the detection cache; changing accepted
 labels rebuilds identities from cached boxes. On the tested
 109.58-second source, a CUDA query scan took about five minutes. The default uses
-two scans on the first run; repeated plans reuse both. The object model uses
-float32 independently of Whisper precision.
+two scans on the first run; repeated plans reuse both. The detector's precision
+setting is independent of Whisper precision; auto uses FP16 on CUDA and FP32 on CPU.
 Auto precision is `int8_float16` on CUDA to limit VRAM use, and `int8` on CPU.
 Character embeddings retain float32 math with TF32 disabled; CUDA convolution
 workspace is limited to reduce memory pressure on the 4 GB laptop GPU.

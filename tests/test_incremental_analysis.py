@@ -51,7 +51,7 @@ def job(tmp_path, monkeypatch):
     config = {'job': {'output_dir': str(tmp_path)},
         'premiere': {'project': 'template.prproj', 'source_media': ['first.mp4', 'unused.mp4']},
         'cubase': {'project': 'template.cpr'},
-        'video': {'source_gap_sec': 0, 'require_lip_motion': True, 'characters': {'enabled': False}}}
+        'video': {'search_fps': 0, 'source_gap_sec': 0, 'require_lip_motion': True, 'characters': {'enabled': False}}}
     def install(ends):
         def analyze(path, **kwargs):
             for end in ends:
@@ -152,6 +152,44 @@ def test_model_errors_abort_instead_of_reading_more_video(job, monkeypatch):
     assert not exports
 
 
+@pytest.mark.parametrize('lips,detector,identity_only', [(False, True, True),
+    (True, True, False), (False, False, False)])
+def test_fast_animation_defers_landmarks_only_with_independent_detector(job, monkeypatch,
+        tmp_path, lips, detector, identity_only):
+    import autoedit.pipeline as pipeline
+    import autoedit.video.objects as objects
+    config, inspect, install, scanned, speech, exports, refined = job
+    config['premiere']['source_media'] = ['first.mp4']
+    config['video'].update(source_kind='animation', require_lip_motion=lips,
+        characters={'enabled': True}, sample_fps=6, incremental_fps=2, search_fps=1)
+    runtime = tmp_path/'detector.exe'
+    model_dir = tmp_path/'model'
+    model_dir.mkdir()
+    if detector:
+        runtime.touch()
+        (model_dir/'model.safetensors').touch()
+    monkeypatch.setattr(objects, 'RUNTIME', runtime)
+    monkeypatch.setattr(objects, 'MODEL_DIR', model_dir)
+    monkeypatch.setattr(objects, 'augment_with_objects', lambda info, *a, **kw: info)
+    def characters(info, *a, **kw):
+        info['character_analysis'] = {'min_main_fraction': .85}
+        for sample in info['samples']:
+            sample.update(character_status='main', character_id='main',
+                character_rank=1, identity_confidence=1.)
+        return info
+    monkeypatch.setattr(pipeline, 'analyze_characters', characters)
+    def analyze(path, **kw):
+        assert kw['sample_fps'] == 2
+        assert kw.get('identity_only', False) == identity_only
+        raw = snapshot(path, 12)
+        assert kw['on_chunk'](raw)
+        return raw
+    monkeypatch.setattr(pipeline, 'analyze_video', analyze)
+    result = pipeline.run_pipeline(config)
+    assert len(result['plan']['slots']) == 1
+    assert refined  # Selected cuts still go through dense verification.
+
+
 def video(tmp_path, seconds=8):
     import cv2
     path = tmp_path/'source.avi'
@@ -187,6 +225,24 @@ def test_decoder_stops_and_resumes_with_context_without_repeating_prefix(tmp_pat
     assert len(times) == len(set(times))
     assert not resumed['shot_times_sec']
     assert resumed['samples'][:19] == first['samples']
+
+
+@pytest.mark.parametrize('kind',['animation','live_action'])
+def test_identity_only_keeps_transitions_and_never_supplies_faces_or_lips(tmp_path,monkeypatch,kind):
+    import autoedit.video.analyzer as analyzer
+    source = video(tmp_path,seconds=2)
+    def forbidden(*a,**kw):
+        pytest.fail('Visual reference candidates must not initialize face/pose models')
+    monkeypatch.setattr('autoedit.video.faces.MultiRegionFaceLandmarker',forbidden)
+    monkeypatch.setattr('autoedit.video.pose.PoseLandmarker',forbidden)
+    monkeypatch.setattr(analyzer,'_detect_opencv',forbidden)
+    raw = analyzer.analyze_video(source,source_kind=kind,identity_only=True,cache_dir=tmp_path/'cache')
+    assert raw['sample_count'] == 12
+    assert raw['cache_identity']['identity_only'] is True
+    assert raw['transition_method'] == 'motion-verified-shot-local-v4'
+    assert raw['quality_method'] == 'reference-candidate-no-landmarks-v1'
+    assert all(not s['faces'] and not s['face_detected'] and not s['clear_face']
+               and not s['speaking'] and not s['lip_geometry_measured'] for s in raw['samples'])
 
 
 def test_complete_cache_replays_prefixes_and_propagates_callback_errors(tmp_path, monkeypatch):
@@ -258,7 +314,8 @@ def test_object_cache_infers_only_new_timestamps(tmp_path, monkeypatch):
     def worker(command, **kw):
         request = json.loads(Path(command[-1]).read_text())
         requests.append(request)
-        data = {'samples': [{'time_sec': s['time_sec'], 'objects': []} for s in request['samples']]}
+        data = {'request_id':request['request_id'], 'complete':True,
+                'samples': [{'time_sec': s['time_sec'], 'objects': []} for s in request['samples']]}
         Path(request['result']).write_text(json.dumps(data))
         return SimpleNamespace(stdout=iter([]), wait=lambda: 0)
     monkeypatch.setattr(objects.subprocess, 'Popen', worker)
@@ -308,7 +365,7 @@ def test_object_batch_oom_retries_without_duplicate_rows(monkeypatch):
         return [[] for _ in images]
     monkeypatch.setattr(worker, 'detect_batch', detect)
     result = worker.scan({'path': 'video', 'model_dir': 'model', 'samples': samples,
-        'settings': {'device': 'auto', 'prompt': 'a person.', 'threshold': .3}}, {}, OrderedDict())
+        'settings': {'device': 'auto', 'batch_size':'auto', 'prompt': 'a person.', 'threshold': .3}}, {}, OrderedDict())
     assert calls == [3, 2, 1]
     assert [row['time_sec'] for row in result['samples']] == [0, 1, 2]
 
@@ -332,6 +389,34 @@ def test_dense_cut_cache_survives_changing_other_selected_cuts(tmp_path, monkeyp
     refine.refine_selected_cuts(source, slots, tmp_path/'cache')
     assert len(measured) > count
     assert all(t >= 1.65 for t in measured[count:])  # includes onset context, never redecodes the first cut
+
+
+@pytest.mark.parametrize('device,enabled', [('cpu', True), ('cuda', True), ('cpu', False)])
+def test_dense_face_queries_respect_device_batch_and_disabled_detector(tmp_path, monkeypatch, device, enabled):
+    import autoedit.video.refine as refine
+    source = video(tmp_path)
+    class Detector:
+        def __init__(self, **kw):
+            pass
+        def detect(self, frame, time):
+            return {**face(), 'faces': [face()]}
+        def close(self):
+            pass
+    monkeypatch.setattr('autoedit.video.faces.MultiRegionFaceLandmarker', Detector)
+    calls = []
+    def scan(info, cache_dir, config, *args):
+        calls.append(config)
+        return {'samples': [{'objects': []} for s in info['samples']]}, {}
+    monkeypatch.setattr('autoedit.video.objects._cached_object_scan', scan)
+    refs = [{'time_sec': i/10, 'frame_width': 640, 'frame_height': 360,
+             **face(), 'backend': 'grounding-dino-face'} for i in range(10)]
+    refine.refine_selected_cuts(source, [{'video': {'in_sec': 0, 'out_sec': 1}}], tmp_path/'cache',
+        source_kind='animation', character_samples=refs,
+        object_config={'enabled': enabled, 'device': device, 'batch_size': 1})
+    if enabled:
+        assert calls and all(c['device'] == device and c['batch_size'] == 1 for c in calls)
+    else:
+        assert not calls
 
 
 def test_object_service_offloads_and_restores_weights_without_loading_again(tmp_path, monkeypatch, capsys):
@@ -367,7 +452,7 @@ def test_object_service_offloads_and_restores_weights_without_loading_again(tmp_
     worker.main()
     assert loaded == [1]
     assert moved == ['cpu', 'cuda:0']
-    assert capsys.readouterr().out.count('RESULT: {}') == 3
+    assert capsys.readouterr().out.count('"ok": true') == 3
 
 
 def test_cli_exposes_analysis_settings():

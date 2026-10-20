@@ -5,6 +5,27 @@ It must never be used as a binary CPR writer.
 """
 from pathlib import Path
 import re
+import struct
+
+
+def _ordered_sampler_nodes(raw):
+    """Read track-node names, excluding instrument/automation string copies.
+
+    This narrow CPR node envelope is also used by the (D) template. Unknown
+    envelopes do not enable duplicate mapping; numbered-name inventory still
+    follows the legacy reader below.
+    """
+    tracks = []
+    pattern = rb"\x80\x00\x00\xbf.{4}(.{4})([^\x00]{1,256})\x00\xef\xbb\xbf"
+    for node in re.finditer(pattern, raw, re.DOTALL):
+        match = re.fullmatch(rb"Sampler Track ([0-9]+)( \(D\))?", node[2], re.IGNORECASE)
+        if not match or struct.unpack(">I", node[1])[0] != len(node[2]) + 4:
+            continue
+        track = {"index": int(match[1]), "name": node[2].decode("ascii")}
+        if match[2]:
+            track["is_duplicate"] = True
+        tracks.append(track)
+    return tracks
 
 
 def inspect_sampler_tracks(path):
@@ -21,8 +42,12 @@ def inspect_sampler_tracks(path):
         names[index] = name
     if not names:
         raise ValueError("No numbered Sampler Track names found in the Cubase template")
-    return {"path": str(src.resolve()), "method": "embedded-name-inventory",
-            "tracks": [{"index": i, "name": names[i]} for i in sorted(names)]}
+    inventory = {"path": str(src.resolve()), "method": "embedded-name-inventory",
+                 "tracks": [{"index": i, "name": names[i]} for i in sorted(names)]}
+    ordered = _ordered_sampler_nodes(raw)
+    if any(t.get("is_duplicate") for t in ordered):
+        inventory["ordered_tracks"] = ordered
+    return inventory
 
 
 def parse_sampler_tracks(selection):
@@ -51,12 +76,76 @@ def parse_sampler_tracks(selection):
     return indices
 
 
-def select_sampler_tracks(inventory, selection, scene_count):
+def duplicate_scene_tracks(inventory, indices, scenes):
+    """Enable (D) companions only when their order exactly fits UID reprises.
+
+    The number printed in a (D) name is a label, not a reliable source binding.
+    Premiere UID identity chooses its sample; CPR track order chooses which
+    companion plays that run. Every selected primary and companion must fit.
+    """
+    ordered = inventory.get("ordered_tracks") or []
+    if (not indices or not scenes or len(indices) >= len(scenes)
+            or len(indices) != len({s["nested_sequence_uid"] for s in scenes})
+            or indices != list(range(indices[0], indices[-1] + 1))
+            or not any(t.get("is_duplicate") for t in ordered)):
+        return None
+    starts = [i for i, t in enumerate(ordered)
+              if not t.get("is_duplicate") and t["index"] == indices[0]]
+    if len(starts) != 1:
+        return None
+    candidates = []
+    for track in ordered[starts[0]:]:
+        if not track.get("is_duplicate") and track["index"] not in indices:
+            break
+        candidates.append(track)
+    if len(candidates) != len(scenes) or len({t["name"] for t in candidates}) != len(candidates):
+        return None
+    available = {t["index"]: t for t in inventory.get("available_tracks", inventory["tracks"])}
+    first, primary_indices, mapped = {}, [], []
+    for scene, track in zip(scenes, candidates):
+        uid = scene["nested_sequence_uid"]
+        if uid in first:
+            if not track.get("is_duplicate"):
+                return None
+            original = first[uid]
+            mapped.append({**track, "index": original["index"], "duplicate_of": original["name"]})
+        else:
+            if track.get("is_duplicate") or available.get(track["index"]) != track:
+                return None
+            first[uid] = track
+            primary_indices.append(track["index"])
+            mapped.append(dict(track))
+    return mapped if primary_indices == indices else None
+
+
+def select_sampler_tracks(inventory, selection, scene_count, *, scenes=None, infer_duplicates=False):
     """Opt in to a subset without renumbering or changing the CPR inventory."""
     indices = parse_sampler_tracks(selection)
     if indices is None:
+        if infer_duplicates and inventory.get("ordered_tracks"):
+            # AI defaults must honor native companion tracks instead of silently
+            # assigning a reprise to the next numbered track. Only a unique,
+            # fully validated native-order/UID mapping can be inferred.
+            count = len({s["nested_sequence_uid"] for s in scenes or []})
+            candidates = []
+            for track in inventory["tracks"]:
+                trial = list(range(track["index"], track["index"] + count))
+                mapped = duplicate_scene_tracks(inventory, trial, scenes)
+                if mapped is not None and len(mapped) == scene_count:
+                    candidates.append(trial)
+            if len(candidates) != 1:
+                raise ValueError("Cannot infer a unique sampler mapping for native (D) tracks; "
+                                 "set the numbered sampler range explicitly")
+            return select_sampler_tracks(inventory, candidates[0], scene_count, scenes=scenes)
         return inventory
     if len(indices) != scene_count:
+        mapped = None
+        if scenes is not None and len(scenes) == scene_count:
+            mapped = duplicate_scene_tracks(inventory, indices, scenes)
+        if mapped is not None:
+            return {**inventory, "available_tracks": inventory["tracks"],
+                    "tracks": mapped, "selected_track_indices": indices,
+                    "mapping_mode": "duplicate_scene_tracks"}
         raise ValueError(f"Selected {len(indices)} sampler tracks for {scene_count} Premiere scene runs; "
                          "select exactly one track per scene")
     available = {track["index"]: track for track in inventory["tracks"]}

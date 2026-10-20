@@ -16,6 +16,23 @@ def test_independent_object_detection_establishes_body_without_inventing_a_face(
     assert subjects[0]['subject_box']==[20,20,90,180]
 
 
+def test_explicit_fallback_can_use_ranked_reference_candidates_without_claiming_image_identity():
+    from autoedit.video.objects import enable_ranked_exposure_fallback
+    for label in ('a vehicle','a robot','a toy'):
+        subject = merge_subjects({'faces':[]},[{'box':[20,20,90,180],'score':.8,
+            'label':label,'target_candidate_only':True}])[0]
+        subject.update(character_status='main',character_rank=1,identity_confidence=.8)
+        raw = {'samples':[{**subject,'faces':[dict(subject)]}]}
+        assert not object_evidence(raw['samples'][0])
+        allowed = enable_ranked_exposure_fallback(raw)['samples'][0]
+        assert object_evidence(allowed) and object_evidence(allowed['faces'][0])
+        assert not allowed.get('reference_match') and not allowed['face_detected']
+        assert not raw['samples'][0].get('exposure_fallback_confirmed')
+        for invalid in ({'identity_confidence':.2},{'character_status':'unknown'},
+                        {'object_confirmed':False},{'object_score':.1}):
+            assert not object_evidence({**allowed,**invalid})
+
+
 def test_lips_belong_to_one_contained_face_not_another_covisible_actor():
     actor=face([30,30,30,40])
     other=face([150,30,30,40])
@@ -178,6 +195,8 @@ def test_object_cache_reuses_model_work_and_rejects_incomplete_results(tmp_path,
     import json
     from types import SimpleNamespace
     import autoedit.video.objects as objects
+    # This isolates box-query caching with fake bytes, not landmark decoding.
+    monkeypatch.setattr('autoedit.video.subjects.refine_actor_faces',lambda info,*args:info)
     source=tmp_path/'video.mp4'
     source.write_bytes(b'input video validated by pipeline')
     runtime=tmp_path/'python.exe'
@@ -193,7 +212,7 @@ def test_object_cache_reuses_model_work_and_rejects_incomplete_results(tmp_path,
     def worker(command,**kwargs):
         request=json.loads(__import__('pathlib').Path(command[-1]).read_text(encoding='utf-8'))
         calls.append(request)
-        result={'samples':[{'time_sec':0,'objects':[{'box':[20,20,110,190],
+        result={'request_id':request['request_id'],'complete':True,'samples':[{'time_sec':0,'objects':[{'box':[20,20,110,190],
                 'label':'skeleton','score':.65}]}]}
         __import__('pathlib').Path(request['result']).write_text(json.dumps(result),encoding='utf-8')
         return SimpleNamespace(stdout=iter(['OBJECT: scanned\n']),wait=lambda:0)
@@ -224,6 +243,7 @@ def test_regional_requests_only_cover_bracketed_holes_without_cuts_or_time_gaps(
 
 def test_regional_geometry_cannot_supply_a_subject_without_a_new_model_detection(tmp_path,monkeypatch):
     import autoedit.video.objects as objects
+    monkeypatch.setattr('autoedit.video.subjects.refine_actor_faces',lambda info,*args:info)
     source=tmp_path/'source.mp4'; source.touch()
     runtime=tmp_path/'python.exe'; runtime.touch()
     model=tmp_path/'model'; model.mkdir()

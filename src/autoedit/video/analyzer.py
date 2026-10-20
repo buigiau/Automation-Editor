@@ -71,11 +71,16 @@ def _visual_quality(cv2, frame, det, previous_gray=None, previous_det=None):
     small = cv2.resize(gray, (64, 36))
     motion = 0.0 if previous_gray is None else float(cv2.absdiff(small, previous_gray).mean()) / 255
     face_detected = bool(det.get("face_detected"))
-    closeup = clarity = 0.0
+    closeup = clarity = face_clarity = readable_face = 0.0
     if face_detected:
         h, w = gray.shape
         x, y, fw, fh = det["face"]
         closeup = min(1.0, max(0, fw * fh) / max(1, w * h) / 0.22)
+        face_crop = gray[max(0,y):min(h,y+fh), max(0,x):min(w,x+fw)]
+        if face_crop.size:
+            face_clarity = min(1., float(cv2.Laplacian(face_crop, cv2.CV_64F).var()) / 150)
+            readable_face = float(face_clarity >= .25 and fw/w >= .05 and fh/h >= .075
+                                  and x >= 0 and y >= 0 and x+fw <= w and y+fh <= h)
         mx, my, mw, mh = det.get("mouth_box") or [x, y + int(fh * 0.55), fw, int(fh * 0.45)]
         # The visible outline is the sharp evidence for a smooth cartoon mouth.
         # A closed one-pixel lip has no interior texture; include its actual edge.
@@ -90,6 +95,7 @@ def _visual_quality(cv2, frame, det, previous_gray=None, previous_det=None):
     if face_detected and previous_det and previous_det.get("face_detected") and motion < 0.3:
         mouth_activity = min(1.0, abs(det.get("openness", 0) - previous_det.get("openness", 0)) * 5)
     return {"closeup_score": closeup, "mouth_clarity": clarity,
+            "face_clarity": face_clarity, "readable_face": readable_face,
             "face_visible": float(face_detected), "mouth_activity": mouth_activity,
             "activity_score": min(1.0, motion / 0.12)}, small
 
@@ -156,7 +162,7 @@ def _merge_segments(
     return segments
 
 
-ANALYSIS_VERSION = 16
+ANALYSIS_VERSION = 18
 
 
 def analysis_prefix(info, end):
@@ -194,6 +200,8 @@ def analyze_video(
     main_group: str = "auto",
     on_chunk: Callable[[dict], bool] | None = None,
     chunk_sec: float = 30.0,
+    start_seconds: float = 0.0,
+    identity_only: bool = False,
 ) -> dict[str, Any]:
     import gzip
     import hashlib
@@ -209,6 +217,8 @@ def analyze_video(
         raise ValueError("Video sampling must be between 2 and 10 fps for temporal lip detection.")
     if not math.isfinite(chunk_sec) or chunk_sec <= 0:
         raise ValueError('video.analysis_chunk_sec must be a positive finite number')
+    if not math.isfinite(start_seconds) or start_seconds < 0:
+        raise ValueError('Video range start must be a finite nonnegative timestamp')
     if backend not in {"auto", "mediapipe", "opencv"}:
         raise ValueError("Unknown video backend")
     if source_kind not in {"live_action", "animation"}:
@@ -225,11 +235,16 @@ def analyze_video(
                 "backend": backend, "source_kind": source_kind, "version": ANALYSIS_VERSION,
                 "pose_model_mtime": POSE_MODEL_PATH.stat().st_mtime_ns if POSE_MODEL_PATH.is_file() else None,
                 "model_mtime": MODEL_PATH.stat().st_mtime_ns if MODEL_PATH.is_file() else None}
+    if start_seconds:
+        identity['start_seconds'] = start_seconds
+    if identity_only:
+        identity['identity_only'] = True
     if main_group != "auto":
         identity.update(main_group=main_group, main_group_version=4)
     if source_kind == 'animation':
         identity['animation_detector_version'] = 7
     callback_elapsed = 0.
+    quality_method = 'reference-candidate-no-landmarks-v1' if identity_only else 'multiregion-verified-face-tracks-v9'
     def invoke(info):
         nonlocal callback_elapsed
         before = time.perf_counter()
@@ -270,7 +285,7 @@ def analyze_video(
 
     cv2, np = _try_cv2()
     detector = pose = None
-    if backend != "opencv":
+    if backend != "opencv" and not identity_only:
         # Fail explicitly: missing/broken landmarks must never fall back to a scene crop.
         try:
             detector = ((MultiRegionFaceLandmarker() if main_group == "auto" else
@@ -299,7 +314,8 @@ def analyze_video(
     cap.release()
     limit = duration if max_seconds <= 0 else min(duration, max_seconds)
     if progress:
-        detector_name = ("minion-goggles-mouth" if main_group == "yellow_minions" else
+        detector_name = ("reference-candidate" if identity_only else
+                         "minion-goggles-mouth" if main_group == "yellow_minions" else
                          "mediapipe-landmarks" if detector else "opencv-diagnostic")
         progress(f"Video scan: {duration / 60:.1f} min, {sample_fps:g} samples/s, sequential decoder, backend={detector_name}")
     started = last_report = time.perf_counter()
@@ -324,8 +340,8 @@ def analyze_video(
         tracker.update(decoded.to_ndarray(format='bgr24'), t, [],
                        cut=any(tracker.last_time < event <= t for event in transitions.events))
     resume_time = samples[-1]['time_sec'] if samples else -1.
-    warm_start = max(0., resume_time - 1.)
-    next_boundary = min((float(resume['analyzed_seconds']) if resume else 0.) + chunk_sec, limit)
+    warm_start = max(start_seconds, resume_time - 1.)
+    next_boundary = min((float(resume['analyzed_seconds']) if resume else start_seconds) + chunk_sec, limit)
     stopped = None
 
     def snapshot(end, complete=False):
@@ -339,9 +355,11 @@ def analyze_video(
                     sample_interval=1/sample_fps), end, min_segment_sec),
                 'backend_counts': dict(Counter(s['backend'] for s in measured)),
                 'analysis_elapsed_sec': round(elapsed, 3), 'cache_identity': identity,
-                'analysis_complete': complete, 'quality_method': 'multiregion-verified-face-tracks-v9',
+                'analysis_complete': complete, 'quality_method': quality_method,
                 'transition_times_sec': sorted(set(transitions.events)), 'transition_method': 'motion-verified-shot-local-v4',
                 'shot_times_sec': sorted(set(transitions.shot_events)), 'shot_method': 'adjacent-frame-histogram-v1'}
+        if start_seconds:
+            info['verified_ranges'] = [[start_seconds, end]]
         if cache:
             cache.parent.mkdir(parents=True, exist_ok=True)
             temporary = cache.with_suffix('.tmp')
@@ -353,7 +371,10 @@ def analyze_video(
                             between_samples=track_between_samples, start_sec=warm_start)
     try:
         for t, frame in frames:
-            det = detector.detect(frame, t) if detector else _detect_opencv(cv2, np, frame)
+            det = ({'backend':'reference-candidate','faces':[],'face_detected':False,
+                    'category':'NEUTRAL','confidence':0.,'clear_face':0.,'speaking':0.,
+                    'lip_geometry_measured':False} if identity_only else
+                   detector.detect(frame, t) if detector else _detect_opencv(cv2, np, frame))
             if detector:
                 faces = tracker.update(frame,t,det.get('faces',[]),
                     cut=any(previous_sample_time < event <= t for event in transitions.events))
@@ -384,11 +405,18 @@ def analyze_video(
                 next_boundary = min(next_boundary + chunk_sec, limit)
             now = time.perf_counter()
             if progress and now - last_report >= 3:
-                elapsed = now - started
+                elapsed = now - started - callback_elapsed
                 eta = elapsed * max(0, limit - t) / max(t, 0.1)
                 faces = sum(bool(s.get("face_detected")) for s in samples)
-                progress(f"Video {100 * t / max(limit, 1):.1f}% | source {t:.0f}/{limit:.0f}s | elapsed {elapsed:.0f}s | ETA {eta:.0f}s | samples={len(samples)} faces={faces}")
+                eta_label = 'full scan ETA' if on_chunk else 'ETA'
+                progress(f"Video {100 * t / max(limit, 1):.1f}% | source {t:.0f}/{limit:.0f}s | elapsed {elapsed:.0f}s | {eta_label} {eta:.0f}s | samples={len(samples)} faces={faces}")
                 last_report = now
+    except BaseException:
+        if samples:
+            # Save measured raw observations even when cancellation or a downstream
+            # model stops the job. They remain incomplete and cannot fill a plan.
+            snapshot(min(limit, samples[-1]['time_sec']))
+        raise
     finally:
         frames.close()
         if pose:
@@ -398,7 +426,7 @@ def analyze_video(
     annotate_speaking(samples, source_kind=source_kind)
     if stopped is not None:
         if progress:
-            progress(f'Stopped source analysis at {stopped["analyzed_seconds"]:.1f}s: all slots verified')
+            progress(f'Stopped source analysis at {stopped["analyzed_seconds"]:.1f}s: complete allocation accepted')
         return stopped
     elapsed = time.perf_counter() - started - callback_elapsed
     actual_end = min(limit, samples[-1]["time_sec"] + 1 / sample_fps) if samples else 0
@@ -411,11 +439,13 @@ def analyze_video(
             "segments": bounded_segments(
                 _merge_segments(samples, min_segment_sec, merge_gap_sec, sample_interval=1 / sample_fps),
                 actual_end, min_segment_sec),
-            "samples": samples, "source_kind": source_kind, "quality_method": "multiregion-verified-face-tracks-v9",
+            "samples": samples, "source_kind": source_kind, "quality_method": quality_method,
             "analysis_elapsed_sec": round(elapsed, 3), "cache_identity": identity,
             "transition_times_sec": sorted(set(transitions.events)), "transition_method": "motion-verified-shot-local-v4",
             "shot_times_sec": sorted(set(transitions.shot_events)), "shot_method": "adjacent-frame-histogram-v1",
             "analysis_complete": True, "decoded_seconds": actual_end}
+    if start_seconds:
+        info['verified_ranges'] = [[start_seconds, actual_end]]
     if cache:
         cache.parent.mkdir(parents=True, exist_ok=True)
         temporary = cache.with_suffix(".tmp")

@@ -45,6 +45,7 @@ def render_sampler_bundle(plan, output_dir):
     plan.pop("cubase_import", None)  # A rebuilt bundle has not been loaded yet.
     slots = plan["cubase_slots"]
     identity = [{"audio": s["audio"], "duration": s["premiere"]["duration_sec"],
+                 "track_index": s["cubase"]["track_index"], "track_name": s["cubase"]["track_name"],
                  "mtime": Path(s["audio"]["path"]).stat().st_mtime_ns} for s in slots]
     digest = hashlib.sha256(json.dumps([RENDER_VERSION, identity, plan.get("mixdown", {}).get("sample_rate") or 48000], sort_keys=True).encode()).hexdigest()[:16]
     samples_dir = out / "sampler_samples" / digest

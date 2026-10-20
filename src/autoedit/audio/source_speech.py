@@ -21,7 +21,8 @@ _MODELS = {}
 
 class _WhisperRuntime:
     def __init__(self, path, device, compute_type, device_index, progress=None):
-        prepare_nvidia_runtime()
+        if device != 'cpu':
+            prepare_nvidia_runtime()
         from faster_whisper import WhisperModel
         import ctranslate2
         self.path = path
@@ -67,7 +68,8 @@ class _WhisperRuntime:
 
     def _load(self):
         return self.factory(self.path, device=self.device, compute_type=self.compute_type,
-                            device_index=self.device_index if self.device == "cuda" else 0)
+                            device_index=self.device_index if self.device == "cuda" else 0,
+                            cpu_threads=4, num_workers=1)
 
     def _report(self):
         if self.progress:
@@ -137,6 +139,8 @@ def _model(name, device="auto", compute_type="auto", device_index=0, progress=No
 def _windows(ranges, padding=1.0):
     windows = []
     for start, end in sorted(set(ranges)):
+        from autoedit.runtime import check_cancelled
+        check_cancelled()
         if not (math.isfinite(start) and math.isfinite(end) and 0 <= start < end):
             raise ValueError("Invalid source transcription range")
         start, end = max(0.0, start-padding), end+padding
@@ -164,6 +168,8 @@ def _decode_window(container, stream, origin, start, end):
             audio[lo:hi] = values[lo-offset:hi-offset]
 
     for frame in container.decode(stream):
+        from autoedit.runtime import check_cancelled
+        check_cancelled()
         if frame.time is not None and float(frame.time)-origin >= end:
             break
         for converted in resampler.resample(frame):
@@ -255,6 +261,8 @@ def transcribe_source(path, ranges, cache_dir, model="small", language="en", pro
             chunks = list(_chunks(windows))
             from autoedit.audio.source_events import detect_vocal_events
             for index, (start, end, core_start, core_end) in enumerate(chunks, 1):
+                from autoedit.runtime import check_cancelled
+                check_cancelled()
                 if progress:
                     progress(f"Whisper source audio {index}/{len(chunks)}: {start:.2f}-{end:.2f}s")
                 samples = _decode_window(container, stream, origin, start, end)

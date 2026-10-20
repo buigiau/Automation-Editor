@@ -93,7 +93,8 @@ def validate_inputs(
         indices = parse_sampler_tracks(sampler_tracks)
         if (indices is not None and info is not None and cubase_project
                 and Path(cubase_project).is_file() and Path(cubase_project).suffix.lower() == ".cpr"):
-            select_sampler_tracks(inspect_sampler_tracks(cubase_project), indices, len(info["scene_slots"]))
+            select_sampler_tracks(inspect_sampler_tracks(cubase_project), indices,
+                                  len(info["scene_slots"]), scenes=info["scene_slots"])
     except ValueError as exc:
         errors.append(f"Cubase sampler selection: {exc}")
     return errors

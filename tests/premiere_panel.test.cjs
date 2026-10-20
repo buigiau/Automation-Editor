@@ -10,14 +10,25 @@ function setup(format = 'payload', options = {}) {
   const mixEdits = [];
   const removed = [];
   const imports = [];
+  const clones = [];
   const markers = [{ name: 'User note', getName() { return this.name; } }];
   let filePickerCalls = 0;
   let refreshCount = 0;
   const tick = seconds => ({ seconds, ticks: String(Math.round(seconds * 254016000000)) });
+  const nestTracks = Array.from({ length: 14 }, () => [[], []]);
+  const videoItem = values => {
+    const data = { name: 'existing.mp4', start: 0, end: 4, inPoint: 0, outPoint: 4,
+      adjustment: false, disabled: false, effects: [], ...values };
+    return { data, name: data.name, getName: async () => data.name,
+      getProjectItem: async () => ({ isSequence: async () => false }),
+      isAdjustmentLayer: async () => data.adjustment, isDisabled: async () => data.disabled,
+      getStartTime: async () => tick(data.start), getEndTime: async () => tick(data.end),
+      getInPoint: async () => tick(data.inPoint), getOutPoint: async () => tick(data.outPoint) };
+  };
   const nests = Array.from({ length: 14 }, (_, i) => ({
     name: String(i + 1), guid: { toString: () => `uid-${i}` },
-    getVideoTrackCount: async () => 2,
-    getVideoTrack: async () => ({ getTrackItems: async () => [] }),
+    getVideoTrackCount: async () => nestTracks[i].length,
+    getVideoTrack: async index => ({ getTrackItems: async () => nestTracks[i][index] }),
     getAudioTrackCount: async () => 0,
   }));
   const instances = [{ start_sec: 0, end_sec: 1, source_in_sec: 0, source_out_sec: 1 },
@@ -152,7 +163,21 @@ function setup(format = 'payload', options = {}) {
       const selection = { items: [], addItem: item => { selection.items.push(item); return true; } };
       callback(selection); return true;
     } },
-    SequenceEditor: { getEditor: dest => ({
+    SequenceEditor: { getEditor: dest => {
+      const editor = {
+      createCloneTrackItemAction: (item, offset, vOffset, aOffset, align, insert) => {
+        assert.equal(offset.seconds, 0); assert.equal(vOffset, 1); assert.equal(aOffset, 0);
+        assert.equal(align, true); assert.equal(insert, false);
+        return () => {
+          if (options.failClone) throw Error('clone rejected');
+          if (options.ignoreClone) return;
+          const tracks = nestTracks[nests.indexOf(dest)];
+          while (tracks.length < 2) tracks.push([]);
+          const copy = videoItem(JSON.parse(JSON.stringify(item.data)));
+          if (options.wrongCloneTiming) copy.data.end += 1;
+          tracks[1].push(copy); clones.push({ dest, original: item, copy });
+        };
+      },
       createOverwriteItemAction: (item, time, v, a) => {
         if (item === mixClip) {
           if (options.failMix) throw Error('audio overwrite rejected');
@@ -164,15 +189,25 @@ function setup(format = 'payload', options = {}) {
         const end = item === secondSource ? secondSource.currentOut.seconds : sourceOut.seconds;
         return () => {
           edits.push({ dest, item, time, v, a, start, end });
+          const index = nests.indexOf(dest);
+          if (index >= 0) nestTracks[index][v] = [videoItem({ end: end-start, inPoint: start, outPoint: end })];
           // Simulate a host routing a source's audio to A1 despite a=-1.
           if (dest === template && item.hasAudio) audioTracks[0][0].bounds[0] = end-start;
         };
       },
       createRemoveItemsAction: (selection, ripple, mediaType, shift) => () => {
-        assert.equal(ripple, false); assert.equal(shift, false); assert.equal(mediaType, 2);
+        assert.equal(ripple, false); assert.equal(shift, false);
+        assert([1, 2].includes(mediaType));
+        if (mediaType === 1) {
+          const tracks = nestTracks[nests.indexOf(dest)];
+          tracks.forEach((items, index) => { tracks[index] = items.filter(item => !selection.items.includes(item)); });
+        }
         removed.push(...selection.items);
       },
-    }) },
+      };
+      if (options.noClone) delete editor.createCloneTrackItemAction;
+      return editor;
+    } },
   };
   if (options.missingMarkers) delete ppro.Markers;
   const elements = new Map();
@@ -192,7 +227,7 @@ function setup(format = 'payload', options = {}) {
     console: { log: () => {} },
   });
   vm.runInContext(fs.readFileSync('plugins/premiere-uxp/main.js', 'utf8'), context);
-  return { context, edits, cuts, payload, fullPlan, project, template, nests, tick, source, secondSource, mixEdits, removed, imports, audioTracks, markers,
+  return { context, edits, cuts, payload, fullPlan, project, template, nests, nestTracks, videoItem, clones, tick, source, secondSource, mixEdits, removed, imports, audioTracks, markers,
     refreshCount: () => refreshCount, mixMarks: () => [mixIn.seconds, mixOut.seconds],
     filePickerCalls: () => filePickerCalls,
     marks: () => [sourceIn.seconds, sourceOut.seconds],
@@ -357,6 +392,36 @@ test('recursive review markers use global timing including V4 instances', async 
 });
 
 for (const format of ['payload', 'plan']) {
+  test(`AI character estimates fill all nests and retain review markers via ${format}`, async () => {
+    const env = setup(format);
+    for (const action of env.payload.fill_nested_sequences) {
+      const selection = { method: 'qwen-local-visual', character_id: 'red-person',
+        character_ids: ['red-person'], decision: 'uncertain', needs_review: true,
+        reference_fallback: false, reason: 'Appearance agreed at two sampled cut frames; inspect full playback.' };
+      action.character_selection = selection;
+      env.fullPlan.slots.find(s => s.id === action.slot_id).video.character_selection = selection;
+    }
+    await env.load(); await env.context.applyPlan();
+    assert.equal(env.edits.length, 14);
+    assert.deepEqual(env.marks(), [7, 97]);
+    const owned = env.markers.filter(m => m.name.startsWith('AUTOEDIT_CHARACTER:'));
+    assert.equal(owned.length, 28);
+    assert.deepEqual(JSON.parse(owned[0].comments).characters, ['red-person']);
+    assert.match(JSON.parse(owned[0].comments).reason, /sampled cut frames/);
+    assert.equal(env.markers[0].name, 'User note');
+    await env.context.applyPlan();
+    assert.equal(env.markers.length, 29);
+  });
+  test(`incomplete AI character metadata aborts before any fill via ${format}`, async () => {
+    const env = setup(format);
+    const selection = { method: 'qwen-local-visual', character_id: 'red-person', needs_review: true };
+    env.payload.fill_nested_sequences[0].character_selection = selection;
+    env.fullPlan.slots[0].video.character_selection = selection;
+    await env.load();
+    await assert.rejects(env.context.applyPlan(), /Invalid character decision for slot-0/);
+    assert.equal(env.edits.length, 0);
+    assert.equal(env.cuts.length, 0);
+  });
   test(`character review marks repeated instances and intro without duplication via ${format}`, async () => {
     const env = setup(format, { characters: true, intro: true });
     await env.load(); await env.context.applyPlan();
@@ -469,6 +534,108 @@ test('invalid last slot is rejected before any cut or overwrite', async () => {
   await env.load(); await assert.rejects(env.context.applyPlan(), /Invalid/);
   assert.equal(env.edits.length, 0); assert.equal(env.cuts.length, 0);
 });
+
+for (const format of ['payload', 'plan']) {
+  test(`V1 Adjustment Layer is cloned with styling before the footage fill via ${format}`, async () => {
+    const env = setup(format);
+    const layer = env.videoItem({ name: 'Adjustment Layer', adjustment: true,
+      inPoint: 3600, outPoint: 3604, effects: [{ name: 'Transform', scale: 150, keys: [[0, 100], [4, 150]] }] });
+    env.nestTracks[0] = [[layer]]; // Cosita nest 1 has no V2 yet.
+    await env.load(); await env.context.applyPlan();
+    assert.equal(env.edits.length, 14);
+    assert.equal(env.clones.length, 1);
+    assert.equal(env.nestTracks[0].length, 2);
+    assert.equal(env.nestTracks[0][0][0].data.adjustment, false);
+    const copy = env.nestTracks[0][1][0];
+    assert.deepEqual(copy.data, layer.data);
+    assert.notEqual(copy, layer);
+    assert.deepEqual(env.marks(), [7, 97]);
+    assert.deepEqual(env.audioTracks[0][0].bounds, [0, 65.8, 1, 66.8]);
+    await env.context.applyPlan();
+    assert.equal(env.edits.length, 28);
+    assert.equal(env.clones.length, 1); // Retry must not stack/double the effects.
+    assert.equal(env.nestTracks[0][1][0], copy);
+  });
+}
+
+test('gaps and multiple source fragments inside the fill range are replaced without touching V2', async () => {
+  const env = setup();
+  const upper = env.videoItem({ adjustment: true, end: .92, outPoint: 3600.92, inPoint: 3600 });
+  env.nestTracks[2] = [[env.videoItem({ start: .2, end: .5 }),
+    env.videoItem({ start: 3.52, end: 4, inPoint: 63.76, outPoint: 64.24 })], [upper]];
+  await env.load(); await env.context.applyPlan();
+  assert.equal(env.edits.length, 14);
+  assert.equal(env.nestTracks[2][0].length, 1);
+  assert.equal(env.nestTracks[2][0][0].data.start, 0);
+  assert.equal(env.nestTracks[2][0][0].data.end, 4);
+  assert.equal(env.nestTracks[2][1][0], upper);
+  assert.equal(env.clones.length, 0);
+});
+
+test('multiple V1 Adjustment Layers retain source marks, disabled state and effects on V2', async () => {
+  const env = setup();
+  const layers = [env.videoItem({ adjustment: true, end: 2, inPoint: 3600, outPoint: 3602 }),
+    env.videoItem({ adjustment: true, start: 2, end: 4, inPoint: 3602, outPoint: 3604,
+      disabled: true, effects: [{ name: 'Lumetri', exposure: .8 }] })];
+  env.nestTracks[3][0] = layers;
+  await env.load(); await env.context.applyPlan();
+  assert.equal(env.edits.length, 14);
+  assert.deepEqual(env.nestTracks[3][1].map(item => item.data), layers.map(item => item.data));
+});
+
+test('a later V1 item outside the fill range aborts every fill before any mutation', async () => {
+  const env = setup();
+  env.nestTracks[0][0] = [env.videoItem({ adjustment: true })];
+  env.nestTracks[13][0] = [env.videoItem({ start: 3, end: 4.04 })];
+  await env.load(); await assert.rejects(env.context.applyPlan(), /outside the planned fill: 14/);
+  assert.equal(env.edits.length, 0); assert.equal(env.clones.length, 0); assert.equal(env.cuts.length, 0);
+});
+
+test('occupied V2 aborts all fills rather than overwriting an existing overlay', async () => {
+  const env = setup();
+  env.nestTracks[13][0] = [env.videoItem({ adjustment: true })];
+  const overlay = env.videoItem({ name: 'existing overlay' });
+  env.nestTracks[13][1] = [overlay];
+  await env.load(); await assert.rejects(env.context.applyPlan(), /empty V2/);
+  assert.equal(env.edits.length, 0); assert.equal(env.clones.length, 0); assert.equal(env.cuts.length, 0);
+  assert.equal(env.nestTracks[13][1][0], overlay);
+});
+
+test('missing adjustment clone API aborts before any source marks or fills', async () => {
+  const env = setup('payload', { noClone: true });
+  env.nestTracks[0][0] = [env.videoItem({ adjustment: true })];
+  await env.load(); await assert.rejects(env.context.applyPlan(), /cannot clone Adjustment Layers/);
+  assert.equal(env.edits.length, 0); assert.equal(env.cuts.length, 0);
+});
+
+for (const failure of ['failClone', 'ignoreClone', 'wrongCloneTiming']) {
+  test(`${failure} never overwrites the original Adjustment Layer`, async () => {
+    const env = setup('payload', { [failure]: true });
+    const layer = env.videoItem({ adjustment: true, effects: [{ scale: 170 }] });
+    env.nestTracks[0][0] = [layer];
+    await env.load(); await assert.rejects(env.context.applyPlan(), /Could not preserve V1 Adjustment Layer/);
+    assert.equal(env.edits.length, 0);
+    assert.equal(env.nestTracks[0][0][0], layer);
+    assert.equal(env.nestTracks[0][1].length, 0);
+    assert.deepEqual(env.marks(), [7, 97]);
+  });
+}
+
+test('a failed overwrite removes staged copies and permits a clean retry', async () => {
+  const options = { failOverwriteAt: 0 };
+  const env = setup('payload', options);
+  const layer = env.videoItem({ adjustment: true, effects: [{ scale: 170 }] });
+  env.nestTracks[0][0] = [layer];
+  await env.load(); await assert.rejects(env.context.applyPlan(), /Fill failed after 0 nests/);
+  assert.equal(env.nestTracks[0][0][0], layer);
+  assert.equal(env.nestTracks[0][1].length, 0);
+  assert.deepEqual(env.marks(), [7, 97]);
+  delete options.failOverwriteAt;
+  await env.context.applyPlan();
+  assert.equal(env.edits.length, 14);
+  assert.equal(env.nestTracks[0][1].length, 1);
+  assert.deepEqual(env.nestTracks[0][1][0].data, layer.data);
+});
 test('overwrite failure stops later fills and restores source marks', async () => {
   const env = setup('payload', { failOverwriteAt: 2 });
   await env.load(); await assert.rejects(env.context.applyPlan(), /Fill failed after 2 nests/);
@@ -507,7 +674,7 @@ test('concurrent apply is rejected', async () => {
 test('manifest permits Premiere 26.0.2 and the test clip button is absent', () => {
   const manifest = JSON.parse(fs.readFileSync('plugins/premiere-uxp/manifest.json', 'utf8'));
   assert.equal(manifest.host.minVersion, '26.0.0');
-  assert.equal(manifest.version, '0.3.1');
+  assert.equal(manifest.version, '0.3.2');
   assert.doesNotMatch(fs.readFileSync('plugins/premiere-uxp/index.html', 'utf8'), /testVid2/);
 });
 test('legacy timeline plan is rejected', async () => {

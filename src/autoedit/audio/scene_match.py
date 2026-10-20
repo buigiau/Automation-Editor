@@ -7,7 +7,7 @@ from autoedit.audio.selection import select_audio_for_source
 from autoedit.audio.taxonomy import TAXONOMY, item_group, item_phonetics, sound_type
 from autoedit.audio.onsets import AudioOnsetError, articulation_onsets, source_onset
 from autoedit.audio.pronunciation import VoiceIndex, source_sounds, valid_sound
-from autoedit.cubase.inspect import parse_sampler_tracks
+from autoedit.cubase.inspect import duplicate_scene_tracks, parse_sampler_tracks
 
 WORD_SHAPES = {sound.label: sound.visemes[0] for _, sound in TAXONOMY.values()
                if sound.visemes and sound.action == "SPEECH" and sound.label not in {"A", "E", "O", "U"}}
@@ -262,7 +262,10 @@ def build_sampler_slots(scenes, video_slots, candidates, video_info, inventory):
     expected = parse_sampler_tracks(inventory.get("selected_track_indices"))
     if expected is None:
         expected = list(range(1, len(scenes)+1))
-    if len(tracks) != len(scenes) or [t["index"] for t in tracks] != expected:
+    duplicate_mapping = inventory.get("mapping_mode") == "duplicate_scene_tracks"
+    valid = (tracks == duplicate_scene_tracks(inventory, expected, scenes) if duplicate_mapping
+             else len(tracks) == len(scenes) and [t["index"] for t in tracks] == expected)
+    if not valid:
         raise ValueError(f"Premiere has {len(scenes)} scene runs but Cubase sampler tracks are "
                          f"{[t['index'] for t in tracks]}; exact ordered mapping is required (no wraparound).")
     parents = {s["premiere"]["nested_sequence_uid"]: s for s in video_slots}
@@ -276,7 +279,7 @@ def build_sampler_slots(scenes, video_slots, candidates, video_info, inventory):
                                          recent=[s["audio"] for s in slots])
             used[selected[uid][0]["path"]] += 1
         audio, evidence = selected[uid]
-        # A later reprise uses the same sample on its own numbered track.
+        # A reprise uses the same sample on its numbered track or (D) companion.
         slots.append({"id": scene["id"], "index": scene["index"], "audio": dict(audio),
                       "video": dict(video), "audio_match": dict(evidence),
                       "premiere": {"nested_sequence": scene["nested_sequence"],
@@ -289,4 +292,6 @@ def build_sampler_slots(scenes, video_slots, candidates, video_info, inventory):
                                  "project": inventory["path"], "start_sec": scene["first_start_sec"],
                                  "preserve_existing_midi": True},
                       "match_status": "sample_selected"})
+        if track.get("is_duplicate"):
+            slots[-1]["cubase"]["duplicate_of"] = track["duplicate_of"]
     return slots

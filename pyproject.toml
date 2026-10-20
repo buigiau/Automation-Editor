@@ -17,6 +17,7 @@ dependencies = [
   "cmudict>=1.1.1,<2",
   "soundfile>=0.13",
   "pyyaml>=6.0",
+  "pillow>=10",
   "huggingface-hub>=0.25,<2",
   "pywinauto>=0.6.9; sys_platform == 'win32'",
 ]

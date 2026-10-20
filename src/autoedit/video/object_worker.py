@@ -5,8 +5,35 @@ import sys
 import time
 
 
+def atomic_result(request, data):
+    if not request.get('result'):
+        return
+    dest = Path(request['result'])
+    temporary = dest.with_suffix('.tmp')
+    temporary.write_text(json.dumps({**data, 'request_id': request.get('request_id')}), encoding='utf-8')
+    temporary.replace(dest)
+
+
+def check_cancel(request):
+    path = request.get('cancel_file')
+    if path and Path(path).exists():
+        raise RuntimeError('Job cancelled; completed object batches have been saved')
+
+
+def trim_frames(frame_cache, limit_bytes=64 * 1024 * 1024):
+    total = sum(frame.nbytes for frame in frame_cache.values())
+    while frame_cache and total > limit_bytes:
+        _, frame = frame_cache.popitem(last=False)
+        total -= frame.nbytes
+
+
 def load_detector(model_dir, device='auto'):
     import torch
+    torch.set_num_threads(2)
+    # Called only once per interpreter; inter-op pools cannot be reconfigured.
+    if not getattr(load_detector, '_threads_set', False):
+        torch.set_num_interop_threads(1)
+        load_detector._threads_set = True
     from transformers import AutoConfig, AutoProcessor, AutoModelForZeroShotObjectDetection
     if device not in ('auto','cpu','cuda'):
         raise ValueError('Object device must be auto, cpu or cuda')
@@ -53,7 +80,7 @@ def detect_batch(processor, model, device, images, settings):
 
 
 def batch_size(settings, device):
-    requested = settings.get('batch_size', 'auto')
+    requested = settings.get('batch_size', 1)
     if requested != 'auto':
         if isinstance(requested, bool) or not isinstance(requested, int) or requested < 1:
             raise ValueError('Object batch_size must be auto or a positive integer')
@@ -69,6 +96,23 @@ def requested_frames(request, frame_cache):
     import av
     from PIL import Image
     samples = request['samples']
+    if Path(request['path']).suffix.lower() in {'.jpg','.jpeg','.png','.webp','.bmp'}:
+        import numpy as np
+        with Image.open(request['path']) as source:
+            native = source.convert('RGB')
+            for expected in samples:
+                check_cancel(request)
+                image = native.resize((expected['width'], expected['height']))
+                transform = None
+                inference_image = image
+                if expected.get('roi'):
+                    sx, sy = native.width/expected['width'], native.height/expected['height']
+                    x0,y0,x1,y1 = expected['roi']
+                    crop = (round(x0*sx),round(y0*sy),round(x1*sx),round(y1*sy))
+                    inference_image = native.crop(crop)
+                    transform = (sx, sy, crop[0], crop[1])
+                yield expected, inference_image, np.asarray(image), transform
+        return
     def key(sample):
         return (request['path'], sample['time_sec'], sample['width'], sample['height'])
     missing = [s for s in samples if s.get('roi') or key(s) not in frame_cache]
@@ -79,10 +123,11 @@ def requested_frames(request, frame_cache):
             stream = container.streams.video[0]
             origin = float(stream.start_time*stream.time_base) if stream.start_time is not None else 0.
             stream.thread_type = 'AUTO'
-            stream.codec_context.thread_count = 4
+            stream.codec_context.thread_count = 2
             container.seek(int((missing[0]['time_sec']+origin)/float(stream.time_base)), stream=stream, backward=True)
             decoded = iter(container.decode(stream))
         for expected in samples:
+            check_cancel(request)
             k = key(expected)
             if not expected.get('roi') and k in frame_cache:
                 image = frame_cache[k]
@@ -111,8 +156,7 @@ def requested_frames(request, frame_cache):
                 transform = (sx, sy, crop[0], crop[1])
             else:
                 frame_cache[k] = image
-                while len(frame_cache) > 256:
-                    frame_cache.popitem(last=False)
+                trim_frames(frame_cache, request.get('settings', {}).get('frame_cache_bytes', 64 * 1024 * 1024))
                 inference_image = Image.fromarray(image)
             yield expected, inference_image, image, transform
     finally:
@@ -123,7 +167,8 @@ def requested_frames(request, frame_cache):
 def scan(request, models, frame_cache):
     import cv2
     import torch
-    settings = request['settings']
+    settings = dict(request['settings'])
+    check_cancel(request)
     index = settings.get('device_index', 0)
     if isinstance(index, bool) or not isinstance(index, int) or index < 0:
         raise ValueError('Object device_index must be a nonnegative integer')
@@ -146,6 +191,8 @@ def scan(request, models, frame_cache):
             models[model_key] = load_detector(request['model_dir'], 'cpu')
             models[model_key][1]._autoedit_fallback_reason = str(exc)
     processor, model, device = models[model_key]
+    if settings.get('compute_type') == 'auto':
+        settings['compute_type'] = 'float16' if device.startswith('cuda') else 'float32'
     if device == 'cpu' and getattr(model, '_autoedit_offloaded', False):
         try:
             device = 'cuda:' + str(index)
@@ -165,10 +212,20 @@ def scan(request, models, frame_cache):
     started = reported = time.perf_counter()
     rows = []
     pending = []
+    def result(complete=False):
+        runtime = {'device':device, 'batch_size':size,
+                   'fallback_reason':getattr(model, '_autoedit_fallback_reason', None),
+                   'compute_type':settings.get('compute_type','float32') if device.startswith('cuda') else 'float32'}
+        if device.startswith('cuda') and hasattr(torch.cuda, 'max_memory_allocated'):
+            runtime['peak_vram_allocated_bytes'] = torch.cuda.max_memory_allocated(device)
+            runtime['peak_vram_reserved_bytes'] = torch.cuda.max_memory_reserved(device)
+        return {'runtime':runtime, 'samples':rows, 'elapsed_sec':time.perf_counter()-started,
+                'complete':complete}
     def flush():
         nonlocal size, device, model, reported
         position = 0
         while position < len(pending):
+            check_cancel(request)
             group = pending[position:position+size]
             query = group[0][0].get('query') or settings['prompt']
             try:
@@ -218,6 +275,7 @@ def scan(request, models, frame_cache):
                     obj['clarity'] = min(1.,float(cv2.Laplacian(crop,cv2.CV_64F).var())/150) if crop.size else 0.
                 rows.append({'time_sec':expected['time_sec'], 'objects':objects})
             position += len(group)
+            atomic_result(request, result())
             if time.perf_counter()-reported >= 3:
                 elapsed = time.perf_counter()-started
                 print(f'OBJECT: Objects {len(rows)}/{len(request["samples"])} | source {rows[-1]["time_sec"]:.1f}s | elapsed {elapsed:.0f}s', flush=True)
@@ -234,10 +292,7 @@ def scan(request, models, frame_cache):
         flush()
     finally:
         frames.close()
-    return {'runtime':{'device':device, 'batch_size':size,
-                      'fallback_reason':getattr(model, '_autoedit_fallback_reason', None),
-                      'compute_type':settings.get('compute_type','float32') if device.startswith('cuda') else 'float32'},
-            'samples':rows, 'elapsed_sec':time.perf_counter()-started}
+    return result(complete=True)
 
 
 def main():
@@ -247,14 +302,29 @@ def main():
     def execute(path):
         request = json.loads(Path(path).read_text(encoding='utf-8'))
         result = scan(request, models, frames)
-        Path(request['result']).write_text(json.dumps(result), encoding='utf-8')
+        atomic_result(request, result)
+        return request.get('request_id')
     if sys.argv[1] != '--serve':
         execute(sys.argv[1])
         return
     for line in sys.stdin:
+        request_id = None
         try:
             value = json.loads(line)
-            if isinstance(value, dict) and value.get('action') == 'offload':
+            request_id = value.get('request_id') if isinstance(value, dict) else None
+            if isinstance(value, dict) and value.get('action') == 'release':
+                import gc
+                import torch
+                models.clear()
+                frames.clear()
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            elif isinstance(value, dict) and value.get('action') == 'scan':
+                returned_id = execute(value['path'])
+                if returned_id != request_id:
+                    raise RuntimeError('Object request identity mismatch')
+            elif isinstance(value, dict) and value.get('action') == 'offload':
                 import torch
                 for key, (processor, model, device) in list(models.items()):
                     if device.startswith('cuda'):
@@ -264,11 +334,12 @@ def main():
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             else:
-                execute(value)
-            print('RESULT: {}', flush=True)
+                request_id = execute(value)
+            print('RESULT: ' + json.dumps({'ok':True, 'request_id':request_id}), flush=True)
         except Exception as exc:
             traceback.print_exc()
-            print('RESULT: ' + json.dumps({'error':str(exc)}), flush=True)
+            print('RESULT: ' + json.dumps({'ok':False, 'request_id':request_id,
+                                         'error_type':type(exc).__name__, 'error':str(exc)}), flush=True)
 
 
 if __name__ == '__main__':

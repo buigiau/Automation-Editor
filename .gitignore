@@ -5,6 +5,8 @@ __pycache__/
 *.pyc
 output/
 config.yaml
+autoedit.settings.json
+autoedit.settings.tmp
 *.egg-info/
 .pytest_cache/
 dist/
@@ -14,3 +16,4 @@ models/*.download
 models/whisper/
 models/characters/
 models/objects/
+models/people/

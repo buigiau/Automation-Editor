@@ -7,13 +7,15 @@ def sampled_frames(path, sample_fps, max_seconds=0, width=640, transition_detect
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
-        stream.codec_context.thread_count = 4
+        stream.codec_context.thread_count = 2
         fps = float(stream.average_rate or 25)
         origin = float(stream.start_time * stream.time_base) if stream.start_time is not None else 0
         next_time = start_sec
         if start_sec > 0:
             container.seek(int((start_sec + origin) / float(stream.time_base)), stream=stream, backward=True)
         for index, frame in enumerate(container.decode(stream)):
+            from autoedit.runtime import check_cancelled
+            check_cancelled()
             if start_sec > 0 and frame.time is None:
                 raise RuntimeError('Cannot resume video without frame timestamps')
             time = (float(frame.time) - origin) if frame.time is not None else index / fps

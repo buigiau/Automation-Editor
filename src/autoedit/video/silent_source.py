@@ -47,6 +47,8 @@ def prepare_video_only_source(path, output_dir, progress=None):
                 video.metadata.update(stream.metadata)
                 last_report = time.monotonic()
                 for packet in source.demux(stream):
+                    from autoedit.runtime import check_cancelled
+                    check_cancelled()
                     if packet.size == 0:
                         continue
                     # Match the zero-based source times used by the video scanner.

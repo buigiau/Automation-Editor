@@ -54,23 +54,98 @@ template     ──► premiere inspector ──► slots (nested seqs, times, t
 
 ## Incremental completion
 
-`until_filled` is the default pipeline mode. The video analyzer retains a live
-decoder/detector session and offers cumulative snapshots every 30 source seconds,
-with one second of right-hand context. The callback enriches new frames with
-object evidence, updates identities and tries the full Premiere allocation,
+`until_filled` is the default pipeline mode. Candidate discovery visits 30-second
+source blocks for reference jobs and jobs with automatic cast ranking disabled.
+Automatic cast ranking uses 30-second prefixes at `incremental_fps` (default 2)
+and stops after a complete allocation meets the verification policy. Explicit `full` scans every
+configured source up to the analysis limit. Both rank individual identities by
+exposure and never pool co-visible lookalikes. Optional-lip animation jobs with
+the installed object detector defer face/pose landmarks to selected cuts;
+independent face/prop queries still qualify candidates before allocation.
+`verification_mode: review` retains this exposure ranking and sparse eligibility,
+caps identity features at four per track, and transcribes only selected ranges.
+It exports all slots without the dense rejection/reselection gate. Every cut and
+audio choice is marked for manual review, with dense and onset verification
+flags false. The following dense verification requirements describe `verified` mode.
+Independent tight animation face queries supplement human landmarks. Contextual
+props and measured stationary screen overlays are rejected before ranking; strong
+face evidence can resolve weak plush-label confusion, while paper/logo rejection
+remains mandatory. Clear-face jobs require readable face evidence across each cut
+and repeat selected-actor verification densely before publishing a plan.
+Spatial Lab frame signatures group recurring compositions with complete-link
+distance, preventing gradual camera moves from bridging unrelated views. Frames
+are decoded at actual analysis timestamps and cached by source metadata, sample
+times and signature version. Greedy allocation, bounded search and dense
+reselection share the configurable two-cut composition limit. Actor exposure
+remains the preference within eligible distinct views; temporal distance alone
+does not make repeated wide shots diverse. A stronger independent tight face
+can resolve weak plush labels and near-full-frame poster/sheet ambiguity;
+localized printed faces and logos remain excluded.
+Remaining face/costume ambiguity schedules a separate person query. A localized
+human body must contain the independently measured tight face in its head region;
+this confirmation can override plush labels but cannot override localized paper
+or printed posters. Dense faces inherit person-class evidence only from the
+selected nearby actor, with fresh face measurements and spatial overlap.
+Central watermark/logo regions corroborated by localized text panels are marked
+as promotional content and excluded by every shot tier, including co-visible
+face tracks. Subtitle bands and corner channel marks remain eligible content.
+For incremental jobs, candidate discovery visits 30-second
+source blocks at 1 fps. Explicit body references use bounded tiled CCIP batches,
+cached by source, timestamps, model fingerprint and tile version. These features
+can be compared with new references without decoding again. Face references and
+automatic cast discovery use the object/face path. Body screening schedules
+separated clip-sized verification windows; remaining positions are still searched
+before exhaustion. Reference screening only requests
+dense work; it never qualifies footage. The range analyzer verifies promising
+regions at 6 fps with bracketing context. The callback enriches new frames with
+object or dense imported-body identity evidence, updates identities and tries the full Premiere allocation,
 including any empty intro. Only a verified allocation with valid sampler bindings
 can stop analysis. Insufficient footage/dense lip rejection continues the scan;
-invalid inputs, models and runtime errors abort it. Sources are visited in input
-order until enough footage is verified. `full` retains whole-source analysis.
+invalid inputs, models and runtime errors abort it. Sparse misses trigger a 2 fps
+discovery pass, then dense verification of remaining regions before source exhaustion.
+Sources are visited in input order until enough footage is verified. `full` retains
+whole-source analysis; `search_fps: 0` retains the legacy dense prefix callbacks.
 
-Character exposure is measured over each analyzed prefix. Checkpoint metadata
-distinguishes committed source duration from decoded context and records the
-stop reason. Chunk boundaries are not shot boundaries. Prefix expansion reuses
-independent object observations and crop embeddings while recomputing tracks and
-cast ranking. Strict lip failures persist as source-local rejected intervals.
+Character exposure is measured over analyzed observations. `verified_ranges`
+specifies continuous dense evidence; searched timestamps do not fill holes.
+Matcher free ranges and source pooling preserve these restrictions, including
+after onset refinement. Region boundaries reset tracks; chunk boundaries within
+continuous evidence are not shot boundaries. Expansion reuses
+independent object observations and crop embeddings. With references, each new
+region is enriched once and namespaced track IDs preserve its completed evidence;
+reference IDs remain shared. A final whole-search cast ranking occurs only for
+exposure fallback after source exhaustion. The reference detector performs one
+query, with FP16 on CUDA and bounded batches of two by default. Reference-crop
+detections may shorten the first discovery query; unclear crops and later passes
+use broad queries. Strict lip failures persist as source-local rejected intervals.
 
-Optional reference images are analyzed once per content/model fingerprint and
-cached independently of video embeddings. Group images provide separate face
+Explicit body references without mandatory lip motion use dense tiled CCIP
+verification before loading the object detector. Each qualifying frame has a
+measured identity feature; a consistent track needs at least two observations.
+Unmatched frames remain holes. These tiles carry no measured face/mouth geometry.
+Their candidate analyzer skips face and pose inference, preserves native-frame
+transition detection and uses a separate cache identity. Dense tile qualification
+retains the stricter original-image CCIP limit; permissive discovery and alternate
+views cannot relax it. Face references and mandatory lip mode keep their models.
+Only tracks confirmed against the original image seed at most eight alternate
+views per target/model. These alternate views guide discovery; adaptation remains within the original-distance bound;
+adapted tracks never seed further views. Cached dense regions are reconsidered
+when this gallery changes. Model hashes are reused within a process while file
+metadata is unchanged. Before exposure fallback, original face observations are
+restored and independent object detection supplies the whole cast.
+Native hard-shot events stay protected. Background-only safety events can be
+suppressed when at least three contiguous dense samples bracket the event,
+identify the same imported target and retain consistent appearance features.
+Original events and suppressed timestamps remain in the evidence; exposure
+fallback restores the original transition checks.
+
+Optional reference images are analyzed once per content/model/region fingerprint and
+cached independently of video embeddings. The GUI displays face suggestions and
+allows explicit whole-character crops. Undetected group images require selection,
+never a whole-image identity fallback. Head and body templates use matching crop
+features. Imported targets bypass category/prop exclusions, including vehicles and
+robots, but remain provisional until consistent reference identity is established.
+Group images provide separate face
 templates; complete-link grouping merges only strongly matching alternate views,
 with reference-image co-occurrence constraints. Each video track must match one
 target consistently across multiple crops. Ambiguous identities are excluded.

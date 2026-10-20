@@ -88,19 +88,48 @@ def cmd_analyze_video(args: argparse.Namespace) -> int:
 def cmd_gui(args: argparse.Namespace) -> int:
     from autoedit.gui import launch
 
-    return launch(args.config)
+    return launch(args.config, legacy=args.legacy)
 
 
 def cmd_run(args: argparse.Namespace) -> int:
     from autoedit.pipeline import run_pipeline
 
     cfg = load_config(args.config)
+    if args.preset:
+        from autoedit.presets import apply_preset, load_settings
+        cfg = apply_preset(cfg, load_settings(args.settings), args.preset)
+    if args.ai:
+        cfg.setdefault('ai', {})['enabled'] = True
+    if args.ai_backend:
+        cfg.setdefault('ai', {}).update(enabled=True, backend=args.ai_backend)
+    if args.local_model:
+        cfg.setdefault('ai', {})['local_model'] = args.local_model
+    if args.local_url:
+        cfg.setdefault('ai', {})['local_url'] = args.local_url
+    if args.local_device:
+        cfg.setdefault('ai', {})['local_device'] = args.local_device
+    if args.local_threads is not None:
+        cfg.setdefault('ai', {})['local_threads'] = args.local_threads
+    if args.local_analysis_mode:
+        cfg.setdefault('ai', {})['local_analysis_mode'] = args.local_analysis_mode
+    if args.local_target_seconds is not None:
+        cfg.setdefault('ai', {})['local_target_seconds'] = args.local_target_seconds
+    if args.local_max_seconds is not None:
+        cfg.setdefault('ai', {})['local_max_seconds'] = args.local_max_seconds
+    if args.ai_model:
+        cfg.setdefault('ai', {})['model'] = args.ai_model
+    if args.ai_video_fps is not None:
+        cfg.setdefault('ai', {})['video_fps'] = args.ai_video_fps
+    if args.ai_max_source_seconds is not None:
+        cfg.setdefault('ai', {})['max_source_seconds'] = args.ai_max_source_seconds
     if getattr(args, 'character_reference', None) is not None:
         cfg.setdefault('video', {}).setdefault('characters', {})['reference_images'] = args.character_reference
     if args.analysis_mode is not None:
         cfg.setdefault('video', {})['analysis_mode'] = args.analysis_mode
     if args.analysis_chunk_sec is not None:
         cfg.setdefault('video', {})['analysis_chunk_sec'] = args.analysis_chunk_sec
+    if args.search_fps is not None:
+        cfg.setdefault('video', {})['search_fps'] = args.search_fps
     if args.source_kind:
         cfg.setdefault("video", {})["source_kind"] = args.source_kind
     if args.source_gap is not None:
@@ -156,6 +185,12 @@ def cmd_mix(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ai_review(args: argparse.Namespace) -> int:
+    from autoedit.pipeline import run_pipeline
+    run_pipeline({'job': {'output_dir': args.output_dir}, '_ai_review': args.edits}, log=_print)
+    return 0
+
+
 def cmd_cubase_import(args: argparse.Namespace) -> int:
     from autoedit.cubase.host import import_samples
     import_samples(args.plan, log=_print)
@@ -192,10 +227,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("gui", help="Pick Premiere / Cubase / video / audio folder and run")
     s.add_argument("-c", "--config")
+    s.add_argument('--legacy', action='store_true', help='Open the previous local-analysis GUI')
     s.set_defaults(func=cmd_gui)
 
     s = sub.add_parser("run", help="Full pipeline: inspect, analyze, match, plan, mixdown")
     s.add_argument("-c", "--config")
+    s.add_argument('--preset', choices=['soda_pop', 'golden', 'cosita'], help='Run AI with a saved project pair')
+    s.add_argument('--settings', help='Preset settings JSON path')
+    s.add_argument('--ai', action='store_true', help='Use AI scene selection with the configured backend')
+    s.add_argument('--ai-backend', choices=['gemini', 'local'], help='Choose Gemini API or local Qwen via Ollama')
+    s.add_argument('--local-model', help='Installed local vision model, e.g. qwen3-vl:4b-instruct')
+    s.add_argument('--local-url', help='Loopback Ollama URL')
+    s.add_argument('--local-device', choices=['cpu', 'gpu'], help='Local CPU (default) or explicit GPU offload')
+    s.add_argument('--local-threads', type=int, help='Local CPU threads (default 2)')
+    s.add_argument('--local-analysis-mode', choices=['until_filled', 'full'], help='Stop at enough candidate scenes (default) or analyze every frame batch')
+    s.add_argument('--local-target-seconds', type=float, help='Desired runtime (default 300); continue searching if footage is still missing')
+    s.add_argument('--local-max-seconds', type=float, help='Optional hard time limit; 0 continues until filled or source exhausted')
+    s.add_argument('--ai-model', help='Gemini model override')
+    s.add_argument('--ai-video-fps',type=float,help='Gemini video sampling density, e.g. 3 FPS')
+    s.add_argument('--ai-max-source-seconds',type=float,help='Analyze only this prefix of each source; 0 = full source')
     s.add_argument("--premiere", help="Premiere .prproj")
     s.add_argument("--cubase", help="Cubase .cpr")
     s.add_argument("--video", action="append", help="Source video file; repeat for multiple videos")
@@ -203,12 +253,18 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--source-kind", choices=["live_action", "animation"], help="Animation uses neutral voices when no source word matches")
     s.add_argument("--source-gap", type=float, help="Minimum seconds between selected source ranges (default 5)")
     s.add_argument('--analysis-mode', choices=['until_filled', 'full'], help='Stop when all slots are verified, or analyze every source')
+    s.add_argument('--search-fps', type=float, help='Candidate search density (default 1; 0 uses the legacy dense search)')
     s.add_argument('--analysis-chunk-sec', type=float, help='Source seconds between allocation checks (default 30)')
     s.add_argument("--main-group", choices=["auto", "yellow_minions"], help=argparse.SUPPRESS)
     s.add_argument('--character-reference', action='append', help='Character portrait or group image; repeat for more characters or alternate views. Omit for automatic selection.')
     s.add_argument("--sampler-tracks", help="Sampler numbers to fill, e.g. 2-13 or 1,3-5; omitted keeps configured mapping")
     s.add_argument("-o", "--output-dir")
     s.set_defaults(func=cmd_run)
+
+    s = sub.add_parser('ai-review', help='Apply review corrections and rebuild the autofill bundle without AI')
+    s.add_argument('edits', help='Corrections JSON downloaded from ai_review.html')
+    s.add_argument('-o', '--output-dir', required=True)
+    s.set_defaults(func=cmd_ai_review)
 
     s = sub.add_parser("cubase-mix", help="Rebuild stems + mixdown from an existing edit-plan.json")
     s.add_argument("plan")

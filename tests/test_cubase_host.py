@@ -43,17 +43,21 @@ def test_import_reads_manual_selection_before_any_project_or_selection_action(tm
 
 @pytest.mark.parametrize("track_indices,name_pattern", [((1, 2), "Sampler Track {i:02d}"),
                                                         (tuple(range(2, 14)), "SAMPLER TRACK {i}")])
-def test_import_updates_open_project_without_saving_and_cleans_success_artifacts(tmp_path, monkeypatch, track_indices, name_pattern):
+@pytest.mark.parametrize("duplicate_name", [None, "SAMPLER TRACK 2 (D)"])
+def test_import_updates_open_project_without_saving_and_cleans_success_artifacts(tmp_path, monkeypatch, track_indices, name_pattern, duplicate_name):
+    names = [name_pattern.format(i=i) for i in track_indices]
+    if duplicate_name:
+        names.append(duplicate_name)
     track_xml = ''.join(
-        f'<obj class="MSamplerTrackEvent"><obj name="Node"><string name="Name" value="{name_pattern.format(i=i)}"/></obj></obj>'
-        for i in track_indices
+        f'<obj class="MSamplerTrackEvent"><obj name="Node"><string name="Name" value="{name}"/></obj></obj>'
+        for name in names
     )
     root = ET.fromstring(f'<root><list name="track">{track_xml}</list></root>')
     project = tmp_path / "paired.cpr"
     plan = {
         "project": {"cubase_project": str(project)},
-        "cubase_slots": [{"cubase": {"track_name": name_pattern.format(i=i), "sample_path": f"sample{i}.wav"}}
-                         for i in track_indices],
+        "cubase_slots": [{"cubase": {"track_name": name, "sample_path": f"sample{i}.wav"}}
+                         for i, name in enumerate(names)],
     }
     plan_path = tmp_path / "edit-plan.json"
     plan_path.write_text(json.dumps(plan))
@@ -86,7 +90,11 @@ def test_import_updates_open_project_without_saving_and_cleans_success_artifacts
     monkeypatch.setattr(host, "verify_sampler_inputs", lambda _slots: [{"ok": True}])
     monkeypatch.setattr(host, "_file_dialog", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(host, "_set_checkbox", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(host, "prepare_archive", lambda _before, _slots, dest: (Path(dest).write_text("archive"), dest)[1])
+    def prepare(_before, slots, dest):
+        assert [s["cubase"]["track_name"] for s in slots] == names
+        Path(dest).write_text("archive")
+        return dest
+    monkeypatch.setattr(host, "prepare_archive", prepare)
     monkeypatch.setattr(host, "verify_import", lambda *_args: {"verified_tracks": 2, "midi_preserved": True})
 
     def export(_app, _window, destination):

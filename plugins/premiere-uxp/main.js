@@ -515,6 +515,85 @@ function sourceDurationFor(action) {
   return Number(action.source_duration_sec || applyDoc.source_duration_sec);
 }
 
+async function adjustmentSignature(item) {
+  return JSON.stringify({
+    name: await readItemName(item),
+    start: await readTickSeconds(item, "getStartTime"),
+    end: await readTickSeconds(item, "getEndTime"),
+    inPoint: await readTickSeconds(item, "getInPoint"),
+    outPoint: await readTickSeconds(item, "getOutPoint"),
+    disabled: typeof item.isDisabled === "function" ? await item.isDisabled() : null,
+  });
+}
+
+async function adjustmentTargetItems(dest) {
+  return await dest.getVideoTrackCount() > 1 ? await clipTrackItems(dest, 1) : [];
+}
+
+async function originalAdjustmentsPresent(dest, preservation) {
+  const current = [];
+  for (const item of await clipTrackItems(dest, 0)) {
+    if (await item.isAdjustmentLayer()) current.push(await adjustmentSignature(item));
+  }
+  return current.length === preservation.signatures.length &&
+    preservation.signatures.every(signature => current.includes(signature));
+}
+
+async function removeStagedAdjustments(project, dest, preservation) {
+  const items = await adjustmentTargetItems(dest);
+  if (!items.length) return;
+  // Never remove the preserved copy if a host failure already changed V1.
+  if (!await originalAdjustmentsPresent(dest, preservation)) {
+    throw new Error("V1 changed; preserved Adjustment Layers were kept on V2. Undo the last fill before retrying.");
+  }
+  let ok = false;
+  project.lockedAccess(() => {
+    ppro.TrackItemSelection.createEmptySelection(selection => {
+      for (const item of items) {
+        if (selection.addItem(item, false) === false) throw new Error("Could not select staged Adjustment Layer");
+      }
+      const editor = ppro.SequenceEditor.getEditor(dest);
+      const remove = editor.createRemoveItemsAction(selection, false, ppro.Constants.MediaType.VIDEO, false);
+      ok = project.executeTransaction(compound => compound.addAction(remove), "Restore Adjustment Layer placement");
+    });
+  });
+  if (!ok) throw new Error("Could not remove staged Adjustment Layers; undo before retrying.");
+}
+
+async function preserveV1Adjustments(project, dest, preservation) {
+  if (!preservation) return;
+  if ((await adjustmentTargetItems(dest)).length || !await originalAdjustmentsPresent(dest, preservation)) {
+    throw new Error("Adjustment Layer layout changed in nested " + dest.name + "; no fill was applied there.");
+  }
+  const editor = ppro.SequenceEditor.getEditor(dest);
+  const zero = await makeTick(0);
+  try {
+    for (const item of preservation.items) {
+      // Clone the track item itself, including its effects and source marks.
+      // Re-inserting its project item would discard item-level styling.
+      const result = runNamedAction(project, "Preserve Adjustment Layer in " + dest.name, () =>
+        editor.createCloneTrackItemAction(item, zero, 1, 0, true, false));
+      if (!result.ok) throw new Error(result.error || "clone transaction failed");
+    }
+    const copies = await adjustmentTargetItems(dest);
+    const signatures = [];
+    for (const item of copies) {
+      if (!await item.isAdjustmentLayer()) throw new Error("V2 copy is not an Adjustment Layer");
+      signatures.push(await adjustmentSignature(item));
+    }
+    if (signatures.length !== preservation.signatures.length ||
+        !preservation.signatures.every(signature => signatures.includes(signature)) ||
+        !await originalAdjustmentsPresent(dest, preservation)) {
+      throw new Error("Premiere did not preserve the Adjustment Layer timing/source marks on V2");
+    }
+  } catch (err) {
+    let message = "Could not preserve V1 Adjustment Layer in nested " + dest.name + ": " + err.message;
+    try { await removeStagedAdjustments(project, dest, preservation); }
+    catch (cleanup) { message += "; " + cleanup.message; }
+    throw new Error(message + ". If V2 could not be created, add an empty V2 in that nest and retry Fill.");
+  }
+}
+
 async function applyNestedPlan() {
   if (!applyDoc || applyDoc.fill_policy !== "nested_sequences_v2") {
     throw new Error("Regenerate edit-plan.json with the updated tool before applying.");
@@ -564,12 +643,28 @@ async function applyNestedPlan() {
     }
     if (await dest.getVideoTrackCount() < 1) throw new Error("Nested sequence has no V1");
     const footage = await clipTrackItems(dest, 0);
-    if (footage.length > 1 || (footage.length === 1 &&
-        (await footage[0].isAdjustmentLayer() || await readTickSeconds(footage[0], "getStartTime") !== 0 ||
-         await readTickSeconds(footage[0], "getEndTime") > duration + 0.000001))) {
-      throw new Error("Nested V1 is not a single source placeholder: " + action.nested_sequence);
+    const adjustments = [];
+    for (const item of footage) {
+      const itemStart = await readTickSeconds(item, "getStartTime");
+      const itemEnd = await readTickSeconds(item, "getEndTime");
+      if (!Number.isFinite(itemStart) || !Number.isFinite(itemEnd) || itemStart < -1e-6 ||
+          itemEnd <= itemStart || itemEnd > duration + 1e-6) {
+        throw new Error("Nested V1 content extends outside the planned fill: " + action.nested_sequence +
+          ". Regenerate the plan from the saved project.");
+      }
+      if (await item.isAdjustmentLayer()) adjustments.push(item);
     }
-    prepared.push({ action, dest, start, end });
+    let preservation = null;
+    if (adjustments.length) {
+      if ((await adjustmentTargetItems(dest)).length) {
+        throw new Error("Nested " + action.nested_sequence + " needs an empty V2 to preserve its V1 Adjustment Layers; no clips were changed.");
+      }
+      if (typeof ppro.SequenceEditor.getEditor(dest).createCloneTrackItemAction !== "function") {
+        throw new Error("Premiere cannot clone Adjustment Layers. Move them from V1 to an empty V2 in nested " + action.nested_sequence + ", then retry Fill.");
+      }
+      preservation = { items: adjustments, signatures: await Promise.all(adjustments.map(adjustmentSignature)) };
+    }
+    prepared.push({ action, dest, start, end, preservation });
   }
   if (!prepared.length) throw new Error("No matching nested sequence in plan");
   const intro = applyDoc.intro_fill;
@@ -625,7 +720,7 @@ async function applyNestedPlan() {
   let failure = null;
   try {
     for (const entry of prepared) {
-      const { action, dest, start, end } = entry;
+      const { action, dest, start, end, preservation } = entry;
       const state = sources.get(fillSourceFor(action));
       const source = state.source;
       const inT = await makeTick(start);
@@ -644,12 +739,20 @@ async function applyNestedPlan() {
       if (tickId(actualIn) !== tickId(inT) || tickId(actualOut) !== tickId(outT)) {
         throw new Error("Premiere did not accept the source range for " + action.slot_id);
       }
+      await preserveV1Adjustments(project, dest, preservation);
       // The fill asset has no audio stream. The overwrite API does not document
       // -1 as an audio-exclusion flag, so that argument alone is insufficient.
       const result = runNamedAction(project, "Fill nested sequence " + action.nested_sequence, () =>
         editor.createOverwriteItemAction(source.projectItem, zero, Number(action.video_track_index), -1)
       );
-      if (!result.ok) throw new Error("Fill failed after " + filled + " nests: " + (result.error || action.slot_id));
+      if (!result.ok) {
+        let message = "Fill failed after " + filled + " nests: " + (result.error || action.slot_id);
+        if (preservation) {
+          try { await removeStagedAdjustments(project, dest, preservation); }
+          catch (cleanup) { message += "; " + cleanup.message; }
+        }
+        throw new Error(message);
+      }
       await verifyAudioUnchanged(dest, audioBefore);
       filled++;
       log("Filled " + action.nested_sequence + " from " + start.toFixed(3) + " to " + end.toFixed(3) + "s");
@@ -881,4 +984,4 @@ bind("inspect", inspectProject);
 bind("load", loadPlan);
 bind("apply", () => applyPlan());
 bind("mix", importMixdown);
-log("AutoEdit 0.3.1 ready (Premiere 26.0+). Video-only fills preserve configured audio from 0s. Load edit-plan.json, then Fill nested clips. Project is not saved automatically.");
+log("AutoEdit 0.3.2 ready (Premiere 26.0+). V1 Adjustment Layers are preserved on V2 before filling video. Load edit-plan.json, then Fill nested clips. Project is not saved automatically.");

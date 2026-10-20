@@ -38,6 +38,12 @@ def _log(log: Log | None, msg: str) -> None:
 
 
 def run_pipeline(config: dict[str, Any], log: Log | None = None) -> dict[str, Any]:
+    from autoedit.runtime import cancellation, job_lock, MemoryMonitor
+    with cancellation(config.get('_cancel_file')), job_lock(log) as waited, MemoryMonitor() as memory:
+        return _run_logged_pipeline({**config, '_queue_wait_sec': round(waited, 3), '_memory': memory}, log)
+
+
+def _run_logged_pipeline(config: dict[str, Any], log: Log | None = None) -> dict[str, Any]:
     """Persist progress/errors even when launched from the GUI."""
     import time
     import traceback
@@ -51,6 +57,9 @@ def run_pipeline(config: dict[str, Any], log: Log | None = None) -> dict[str, An
         import platform
         import os
         data = {'status':status, 'total_sec':round(time.perf_counter()-started,3),
+                'queue_wait_sec':config.get('_queue_wait_sec', 0),
+                'ai_cache_hit': config.get('_ai_cache_hit'),
+                'memory':config['_memory'].report,
                 'stage_seconds':config['_timings'], 'platform':platform.platform(),
                 'processor':platform.processor(), 'cpu_threads':os.cpu_count()}
         (out/'performance.json').write_text(json.dumps(data,indent=2),encoding='utf-8')
@@ -68,7 +77,8 @@ def run_pipeline(config: dict[str, Any], log: Log | None = None) -> dict[str, An
         except Exception as exc:
             report(f"FAILED after {time.perf_counter() - started:.1f}s: {exc}")
             logfile.write(traceback.format_exc())
-            performance('failed')
+            from autoedit.runtime import JobCancelled
+            performance('cancelled' if isinstance(exc, JobCancelled) else 'failed')
             raise
         report(f"Run completed in {time.perf_counter() - started:.1f}s")
         performance('completed')
@@ -88,6 +98,9 @@ def _timed(config, name, function, *args, **kwargs):
 
 
 def _run_pipeline(config: dict[str, Any], log: Log | None = None) -> dict[str, Any]:
+    if config.get('ai', {}).get('enabled') or config.get('_ai_review'):
+        from autoedit.ai.pipeline import run_ai_pipeline
+        return run_ai_pipeline(config, log)
     job = config.get("job") or {}
     out = Path(job.get("output_dir") or "./output")
     out.mkdir(parents=True, exist_ok=True)
@@ -95,7 +108,24 @@ def _run_pipeline(config: dict[str, Any], log: Log | None = None) -> dict[str, A
     premiere_cfg = config.get("premiere") or {}
     audio_cfg = config.get("audio") or {}
     video_cfg = config.get("video") or {}
+    verification_mode = video_cfg.get('verification_mode', 'verified')
+    if verification_mode not in {'verified', 'review'}:
+        raise ValueError('video.verification_mode must be verified or review')
+    review_mode = verification_mode == 'review'
+    if review_mode:
+        requested_characters = character_settings(video_cfg.get('characters'))
+        video_cfg = {**video_cfg, 'require_lip_motion': False, 'characters': {
+            **requested_characters,
+            'embeddings_per_track': min(requested_characters.get('embeddings_per_track', 8), 4)}}
+        config = {**config, 'video': video_cfg}
+        _log(log, 'Fast review export: retain exposure-ranked characters; sample up to four identity images per track; '
+                  'transcribe selected ranges only; defer dense face/lip/onset checks to manual review')
     character_cfg = character_settings(video_cfg.get("characters"))
+    body_references = any(region.get('kind') == 'body'
+        for regions in character_cfg.get('reference_regions', {}).values() for region in regions)
+    character_cfg['_require_actor_face'] = video_cfg.get('require_clear_face', not body_references)
+    if not isinstance(character_cfg['_require_actor_face'], bool):
+        raise ValueError('video.require_clear_face must be true or false')
     cubase_cfg = config.get("cubase") or {}
     template_name = premiere_cfg.get("template_sequence") or "PJ 5 - demo"
     source_kind = str(video_cfg.get("source_kind") or "live_action")
@@ -145,11 +175,17 @@ def _run_pipeline(config: dict[str, Any], log: Log | None = None) -> dict[str, A
     slots = inspect.get("slots") or []
     scenes = inspect.get("scene_slots") or []
     inventory = inspect_sampler_tracks(cubase_cfg["project"])
-    inventory = select_sampler_tracks(inventory, cubase_cfg.get("sampler_tracks"), len(scenes))
+    inventory = select_sampler_tracks(inventory, cubase_cfg.get("sampler_tracks"), len(scenes), scenes=scenes)
     (out / "cubase_inspect.json").write_text(json.dumps(inventory, indent=2), encoding="utf-8")
     if len(scenes) != len(inventory["tracks"]):
         raise ValueError(f"Premiere scene runs={len(scenes)}, Cubase sampler tracks={len(inventory['tracks'])}. Select the paired template.")
-    _log(log, f"Audio mapping: {len(scenes)} scene runs -> {len(inventory['tracks'])} numbered sampler tracks")
+    if inventory.get("mapping_mode") == "duplicate_scene_tracks":
+        duplicates = sum(bool(t.get("is_duplicate")) for t in inventory["tracks"])
+        _log(log, f"Audio mapping: {len(scenes)} scene runs -> "
+                  f"{len(inventory['tracks']) - duplicates} numbered sampler tracks + {duplicates} (D) companions; "
+                  "repeated Premiere UIDs reuse their selected sample")
+    else:
+        _log(log, f"Audio mapping: {len(scenes)} scene runs -> {len(inventory['tracks'])} numbered sampler tracks")
     if inventory.get("selected_track_indices"):
         _log(log, "Selected sampler tracks: " + ", ".join(t["name"] for t in inventory["tracks"]))
 
@@ -186,40 +222,86 @@ def _run_pipeline(config: dict[str, Any], log: Log | None = None) -> dict[str, A
     mode = video_cfg.get('analysis_mode', 'until_filled')
     if mode not in {'until_filled', 'full'}:
         raise ValueError('video.analysis_mode must be until_filled or full')
+    requested_mode = mode
+    automatic_cast = character_cfg['enabled'] and not character_cfg.get('reference_images')
+    if automatic_cast:
+        _log(log, 'Automatic cast ranking: ' + ('rank the analyzed footage and stop after all slots pass verification'
+            if mode == 'until_filled' else 'analyze every configured source before ranking individuals'))
     import math
     import time
     chunk_sec = float(video_cfg.get('analysis_chunk_sec', 30))
     if not math.isfinite(chunk_sec) or chunk_sec <= 0:
         raise ValueError('video.analysis_chunk_sec must be a positive finite number')
+    scan_fps = float(video_cfg.get('sample_fps') or 6)
+    if not math.isfinite(scan_fps) or not 2 <= scan_fps <= 10:
+        raise ValueError('Video sampling must be between 2 and 10 fps for temporal lip detection.')
+    fast_animation = False
+    if mode == 'until_filled' and automatic_cast and float(video_cfg.get('search_fps', 1)) != 0:
+        incremental_fps = float(video_cfg.get('incremental_fps', 2))
+        if not math.isfinite(incremental_fps) or not 2 <= incremental_fps <= 10:
+            raise ValueError('video.incremental_fps must be between 2 and 10')
+        scan_fps = min(scan_fps, incremental_fps)
+        from autoedit.video.objects import RUNTIME, MODEL_DIR
+        fast_animation = (source_kind == 'animation' and not video_cfg.get('require_lip_motion')
+            and (video_cfg.get('object_detection') or {}).get('enabled', 'auto') is not False
+            and RUNTIME.is_file() and (MODEL_DIR / 'model.safetensors').is_file())
+        _log(log, f'Incremental cast scan at {scan_fps:g} fps; selected cuts retain dense face/lip verification')
     config = {**config, 'job': {**job, 'output_dir': str(out)}}
     from autoedit.audio.source_speech import IncrementalSpeech
     speech_session = IncrementalSpeech(transcribe_source, chunk_sec) if mode == 'until_filled' else None
     def speech_scan(path, analyzed, cache_dir, **kwargs):
+        if isinstance(analyzed, list):
+            return _timed(config, 'source_speech', transcribe_source, path, [tuple(r) for r in analyzed], cache_dir, **kwargs)
         if speech_session:
             return _timed(config, 'source_speech', speech_session.scan, path, analyzed, cache_dir, **kwargs)
         return _timed(config, 'source_speech', transcribe_source, path, [(0.0, analyzed)], cache_dir, **kwargs)
     from autoedit.video.objects import ObjectScanSession
     runtime = {}
+    reference_gallery = {}
     rejected_by_source = {}
-    _log(log, f'Analysis mode={mode}; chunk={chunk_sec:g}s; cast ranking uses analyzed footage')
+    scope = 'all configured source footage' if mode == 'full' else 'analyzed footage'
+    _log(log, f'Analysis mode={mode}; chunk={chunk_sec:g}s; cast ranking uses {scope}')
     with ObjectScanSession() as object_session:
         for source_media in sources:
             _log(log, f'Analyzing selected source video {source_media}')
             current = None
             attempts = 0
+            def prepare_region(raw):
+                from autoedit.runtime import check_cancelled, release_inference
+                check_cancelled()
+                release_inference(runtime)
+                if raw.get('_body_reference_verification'):
+                    from autoedit.video.reference_verify import verify_body_references
+                    return _timed(config,'reference_verification',verify_body_references,raw,out / 'video_cache',
+                        character_cfg,reference_gallery,progress=lambda m:_log(log,'  '+m))
+                enriched = raw
+                if character_cfg['enabled']:
+                    from autoedit.video.objects import augment_with_objects
+                    from autoedit.video.reference_search import body_screening_enabled
+                    object_cfg = {**(video_cfg.get('object_detection') or {}),
+                                  'target_references':bool(character_cfg.get('reference_images')),
+                                  'target_body_references':body_screening_enabled({**video_cfg,'reference_discovery':'auto'}),
+                                  'target_prompt':raw.get('_reference_prompt')}
+                    enriched = _timed(config, 'objects', augment_with_objects, raw, out / 'video_cache', object_cfg,
+                        progress=lambda m: _log(log, '  ' + m), session=object_session)
+                object_session.offload()
+                region_characters = {**character_cfg, '_reference_gallery':reference_gallery}
+                enriched = _timed(config, 'characters', analyze_characters, enriched, out / 'video_cache', region_characters,
+                    progress=lambda m: _log(log, '  ' + m), runtime_cache=runtime)
+                release_inference(runtime)
+                return enriched
+
             def evaluate(raw):
                 nonlocal selected, last_failure, current, attempts
                 attempts += 1
                 started = time.perf_counter()
                 raw.setdefault('path', source_media)
-                enriched = raw
-                if character_cfg['enabled']:
-                    from autoedit.video.objects import augment_with_objects
-                    enriched = _timed(config, 'objects', augment_with_objects,raw, out / 'video_cache', video_cfg.get('object_detection'),
-                        progress=lambda m: _log(log, '  ' + m), session=object_session)
-                object_session.offload()
-                enriched = _timed(config, 'characters', analyze_characters,enriched, out / 'video_cache', character_cfg,
-                    progress=lambda m: _log(log, '  ' + m), runtime_cache=runtime)
+                from autoedit.runtime import check_cancelled, release_inference
+                check_cancelled()
+                enriched = raw if raw.get('_regions_enriched') else prepare_region(raw)
+                from autoedit.video.composition import annotate_compositions
+                enriched = _timed(config, 'compositions', annotate_compositions, enriched, out / 'video_cache',
+                    progress=lambda m: _log(log, '  ' + m))
                 current = enriched
                 pool = source_infos + [enriched]
                 _log(log, f'  Evidence ready through {enriched.get("analyzed_seconds", enriched["duration_sec"]):.1f}s '
@@ -235,31 +317,49 @@ def _run_pipeline(config: dict[str, Any], log: Log | None = None) -> dict[str, A
                         if sum(len(ranges) for ranges in rejected_by_source.values()) > failed_before:
                             # Dense rejections can require a different intro reservation.
                             continue
-                        _log(log, f'  Allocation not verified yet: {exc}; continue source analysis')
+                        _log(log, f'  Allocation not complete yet: {exc}; continue source analysis')
                         return False
-                _log(log, f'  Verified slots={len(slots)}/{len(slots)}; source analysis can stop')
+                _log(log, f'  {"Selected for manual review" if review_mode else "Verified"} '
+                          f'slots={len(slots)}/{len(slots)}; source analysis can stop')
                 return True
-            raw = _timed(config, 'source_processing_inclusive', analyze_video,
-                source_media,
-                sample_fps=float(video_cfg.get('sample_fps') or 6),
-                max_seconds=float(video_cfg.get('max_seconds') or 0),
-                min_segment_sec=float(video_cfg.get('min_segment_sec') or 0.25),
-                merge_gap_sec=float(video_cfg.get('merge_gap_sec') or 0.20),
-                backend=str(video_cfg.get('backend') or 'auto'),
-                progress=lambda m: _log(log, '  ' + m), cache_dir=out / 'video_cache',
-                source_kind=source_kind, main_group=character_cfg['main_group'],
-                **({'on_chunk': evaluate, 'chunk_sec': chunk_sec} if mode == 'until_filled' else {}))
+            if mode == 'until_filled' and not automatic_cast and float(video_cfg.get('search_fps', 1)) != 0:
+                from autoedit.video.search import search_video
+                raw = _timed(config, 'source_processing_inclusive', search_video, source_media,
+                    video_cfg, slots + ([inspect['intro_slot']] if (inspect.get('intro_slot') or {}).get('status') == 'empty' else []),
+                    out / 'video_cache', object_session, evaluate, progress=lambda m: _log(log, '  ' + m),
+                    **({'enrich_region':prepare_region} if character_cfg.get('reference_images') else {}))
+            else:
+                raw = _timed(config, 'source_processing_inclusive', analyze_video,
+                    source_media,
+                    sample_fps=scan_fps,
+                    max_seconds=float(video_cfg.get('max_seconds') or 0),
+                    min_segment_sec=float(video_cfg.get('min_segment_sec') or 0.25),
+                    merge_gap_sec=float(video_cfg.get('merge_gap_sec') or 0.20),
+                    backend=str(video_cfg.get('backend') or 'auto'),
+                    progress=lambda m: _log(log, '  ' + m), cache_dir=out / 'video_cache',
+                    source_kind=source_kind, main_group=character_cfg['main_group'],
+                    **({'identity_only': True} if fast_animation else {}),
+                    **({'on_chunk': evaluate, 'chunk_sec': chunk_sec} if mode == 'until_filled' else {}))
             if mode == 'full':
                 raw.setdefault('path', source_media)
                 if character_cfg['enabled']:
                     from autoedit.video.objects import augment_with_objects
-                    raw = _timed(config, 'objects', augment_with_objects,raw, out / 'video_cache', video_cfg.get('object_detection'),
+                    raw = _timed(config, 'objects', augment_with_objects,raw, out / 'video_cache',
+                        {**(video_cfg.get('object_detection') or {}), 'target_references':bool(character_cfg.get('reference_images'))},
                         progress=lambda m: _log(log, '  ' + m), session=object_session)
                 object_session.offload()
                 current = _timed(config, 'characters', analyze_characters,raw, out / 'video_cache', character_cfg,
                     progress=lambda m: _log(log, '  ' + m), runtime_cache=runtime)
+                from autoedit.video.composition import annotate_compositions
+                current = _timed(config, 'compositions', annotate_compositions, current, out / 'video_cache',
+                    progress=lambda m: _log(log, '  ' + m))
+                from autoedit.runtime import release_inference
+                release_inference(runtime)
             elif not attempts:  # Also supports custom analyzers returning a complete snapshot.
                 evaluate(raw)
+            if current is not None and raw.get('searched_until_sec') is not None:
+                for field in ('analysis_complete', 'searched_until_sec'):
+                    current[field] = raw[field]
             source_infos.append(current)
             if mode == 'until_filled' and selected:
                 break
@@ -271,6 +371,13 @@ def _run_pipeline(config: dict[str, Any], log: Log | None = None) -> dict[str, A
                 last_failure = exc
         if selected is None and character_cfg.get('reference_images'):
             _log(log, 'Reference search exhausted configured sources/limits; enabling exposure-ranked fallback')
+            for index, info in enumerate(source_infos):
+                if info.get('_regions_enriched'):
+                    _log(log, '  Ranking the complete searched cast once for reference fallback')
+                    source_infos[index] = _timed(config, 'characters', analyze_characters, info,
+                        out / 'video_cache', character_cfg, progress=lambda m: _log(log, '  ' + m), runtime_cache=runtime)
+                    from autoedit.runtime import release_inference
+                    release_inference(runtime)
             selected = _select_candidate({**config, '_allow_reference_fallback': True}, source_infos,
                 slots, scenes, inspect, inventory, audio_items, list(notes), log, speech_scan, rejected_by_source)
     runtime.clear()
@@ -278,13 +385,22 @@ def _run_pipeline(config: dict[str, Any], log: Log | None = None) -> dict[str, A
         raise last_failure or InsufficientFootageError('Not enough qualifying footage to fill all slots')
     plan, video_info, speech, lip_info = selected
     plan['video_analysis_meta'].update(
-        analysis_mode=mode, stop_reason='all_slots_verified' if mode == 'until_filled' else 'full_scan',
-        character_ranking_scope='analyzed_footage',
+        analysis_mode=mode, stop_reason=('all_slots_selected_for_review' if review_mode else 'all_slots_verified')
+            if mode == 'until_filled' else 'full_scan',
+        verification_mode=verification_mode, needs_review=review_mode,
+        requested_analysis_mode=requested_mode,
+        character_ranking_scope='configured_sources' if mode == 'full' else 'analyzed_footage',
+        subject_filters=[{'path':i['path'], **i.get('subject_filter',{})} for i in source_infos],
+        compositions=[{'path':i['path'], **i.get('composition_analysis',{})} for i in source_infos],
         inference=[{'path': i['path'], 'objects':i.get('object_analysis', {}).get('runtime'),
             'characters':i.get('character_analysis', {}).get('execution')} for i in source_infos],
         analyzed_sources=[{'path': i['path'], 'duration_sec': i['duration_sec'],
+            'sample_fps': i.get('sample_fps'),
             'analyzed_seconds': i.get('analyzed_seconds', i['duration_sec']),
-            'decoded_seconds': i.get('decoded_seconds', i.get('analyzed_seconds', i['duration_sec']))}
+            'decoded_seconds': i.get('decoded_seconds', i.get('analyzed_seconds', i['duration_sec'])),
+            'verified_ranges': i.get('verified_ranges'), 'verified_seconds':i.get('verified_seconds'),
+            'searched_until_sec':i.get('searched_until_sec'), 'search_fps':i.get('search_fps'),
+            'dense_region_count':i.get('dense_region_count')}
             for i in source_infos])
     if video_info.get('character_analysis'):
         (out / 'character_analysis.json').write_text(json.dumps(video_info['character_analysis'], indent=2), encoding='utf-8')
@@ -328,10 +444,11 @@ def _run_pipeline(config: dict[str, Any], log: Log | None = None) -> dict[str, A
 
 
 def _select_candidate(config, source_infos, slots, scenes, inspect, inventory, audio_items, notes, log, speech_scan, rejected_by_source):
-    """Verify an entire allocation before committing artifacts or stopping decode."""
+    """Accept an entire allocation under the configured verification policy."""
     out = Path(config['job']['output_dir'])
     sources = [i['path'] for i in source_infos]
     video_cfg = config.get('video') or {}
+    review_mode = video_cfg.get('verification_mode', 'verified') == 'review'
     character_cfg = character_settings(video_cfg.get('characters'))
     source_kind = video_cfg.get('source_kind') or 'live_action'
     def select(*args, **kwargs):
@@ -339,8 +456,21 @@ def _select_candidate(config, source_infos, slots, scenes, inspect, inventory, a
     gap = float(video_cfg.get('source_gap_sec', 5.0))
     source_media = sources[0]
     video_info = combine_video_infos(source_infos, gap)
+    if config.get('_allow_reference_fallback') and character_cfg.get('reference_images'):
+        from autoedit.video.objects import enable_ranked_exposure_fallback
+        video_info = enable_ranked_exposure_fallback(video_info)
     video_info['reference_only'] = bool(character_cfg.get('reference_images')) and not config.get('_allow_reference_fallback', False)
     video_info["source_kind"] = source_kind
+    body_references = any(region.get('kind') == 'body'
+        for regions in character_cfg.get('reference_regions', {}).values() for region in regions)
+    require_clear_face = video_cfg.get('require_clear_face', not body_references)
+    if not isinstance(require_clear_face, bool):
+        raise ValueError('video.require_clear_face must be true or false')
+    video_info['require_clear_face'] = require_clear_face
+    max_similar = video_cfg.get('max_similar_cuts', 2)
+    if isinstance(max_similar, bool) or not isinstance(max_similar, int) or max_similar < 0:
+        raise ValueError('video.max_similar_cuts must be a non-negative integer (0 disables the limit)')
+    video_info['max_similar_cuts'] = max_similar
     rejected_ranges = []
     for info in source_infos:
         offset = next((s['offset_sec'] for s in video_info.get('source_spans', []) if s['path'] == info['path']), 0.)
@@ -377,7 +507,7 @@ def _select_candidate(config, source_infos, slots, scenes, inspect, inventory, a
         excluded = [(extra["in_sec"], extra["out_sec"])]
         _log(log, f"Intro reserved at {extra['in_sec']:.3f}-{extra['out_sec']:.3f}s before sound-led cuts.")
     _log(log, "Selection mode: " + ("verified moving mouths" if require_lip_motion else
-         "clear character shots; mouth evidence controls audio review, not footage eligibility"))
+         "clear faces required throughout cuts" if require_clear_face else "visible character shots; body-only fallback enabled"))
     _log(log, "Checking full-duration person evidence before source-audio analysis.")
     if visual_matches is None:
         visual_matches = select(slots, [], video_info, min_gap_sec=gap,
@@ -386,36 +516,60 @@ def _select_candidate(config, source_infos, slots, scenes, inspect, inventory, a
     for source_info in source_infos:
         analyzed = min(float(source_info["duration_sec"]),
                        float(source_info.get("analyzed_seconds") or source_info["duration_sec"]))
-        _log(log, f"Scanning source audio {source_info['path']} across 0-{analyzed:.3f}s before selecting sound-led cuts.")
-        speech_by_source[source_info["path"]] = speech_scan(source_info["path"], analyzed, out / "video_cache",
+        ranges = source_info.get('verified_ranges')
+        if review_mode:
+            cuts = [m['video'] for m in visual_matches]
+            if extra:
+                cuts.append(extra)
+            if video_info.get('source_spans'):
+                cuts = [local_cut(video_info, cut) for cut in cuts
+                        if span_for_cut(video_info, cut)['path'] == source_info['path']]
+            ranges = sorted({(max(0., cut['in_sec']-1.), min(analyzed, cut['out_sec']+1.))
+                             for cut in cuts})
+            if not ranges:
+                speech_by_source[source_info['path']] = {'status': 'not-selected', 'has_audio': False,
+                    'words': [], 'events': [], 'scope': 'selected-cuts-only'}
+                continue
+        _log(log, f"Scanning source audio {source_info['path']} in {ranges or [(0, analyzed)]} before selecting sound-led cuts.")
+        speech_by_source[source_info["path"]] = speech_scan(source_info["path"], ranges if ranges is not None else analyzed, out / "video_cache",
                                model=video_cfg.get("speech_model") or "small",
                                language=video_cfg.get("speech_language", "en"),
                                device=video_cfg.get("speech_device", "auto"),
                                compute_type=video_cfg.get("speech_compute_type", "auto"),
                                device_index=video_cfg.get("speech_device_index", 0),
                                progress=lambda m: _log(log, "  " + m))
+        if review_mode:
+            speech_by_source[source_info['path']] = {**speech_by_source[source_info['path']],
+                'scope': 'selected-cuts-only', 'requested_ranges': [list(r) for r in ranges]}
     speech = speech_by_source[source_infos[0]["path"]]
     if video_info.get("source_spans"):
         speech = {"model": video_cfg.get("speech_model") or "small", "words": [], "events": [],
                   "sources": speech_by_source}
+        if review_mode:
+            speech['scope'] = 'selected-cuts-only'
         for span in video_info["source_spans"]:
             shifted = shift_times(speech_by_source[span["path"]], span["offset_sec"])
             for field in ("words", "events"):
                 speech[field].extend({**item, "source_video": span["path"]} for item in shifted.get(field, []))
     video_info["source_speech"] = speech
     video_info["sound_anchors"] = build_sound_anchors(audio_items, speech)
+    from autoedit.runtime import release_inference
+    release_inference({})  # The transcript is plain data; free Whisper before dense GPU face queries.
     _log(log, f"  library-matched sound onsets={len(video_info['sound_anchors'])}; retaining slot lengths and source gaps")
     _log(log, f"  high-confidence onsets={sum(a['confidence_tier'] == 1 for a in video_info['sound_anchors'])}; "
               f"remaining supported onsets need listening review")
     matches = (select(slots, [], video_info, min_gap_sec=gap,
                                     excluded_ranges=excluded, require_lip_motion=require_lip_motion, rejected_ranges=rejected_ranges)
                if video_info["sound_anchors"] else visual_matches)
-    notes.append("Cuts prefer exposure-ranked actors, then library-matched sound onsets within each rank; each scene uses the WAV matching its opening sound. Unmatched speaking cuts use measured visemes/rhythm and require review. Legacy unvoiced selection may use neutral fallback.")
+    notes.append(f"Cuts limit recurring camera compositions to {max_similar or 'unlimited'} uses, then prefer exposure-ranked actors and library-matched sound onsets; each scene uses the WAV matching its opening sound. Unmatched speaking cuts use measured visemes/rhythm and require review. Legacy unvoiced selection may use neutral fallback.")
     for slot, match in zip(slots, matches):
         selected = match["video"]
         metrics = selected.get("selection_metrics") or {}
         _log(log, f"  clip {slot.get('nested_sequence')}: source {selected['in_sec']:.3f}-{selected['out_sec']:.3f}s "
-                  f"tier={metrics.get('tier')} clear_face={metrics.get('clear_face', 0):.2f} speaking={metrics.get('speaking', 0):.2f}")
+                  f"tier={metrics.get('tier')} readable_face={metrics.get('readable_face', 0):.2f} "
+                  f"mouth_clear={metrics.get('clear_face', 0):.2f} speaking={metrics.get('speaking', 0):.2f}")
+        if metrics.get('composition_ids'):
+            _log(log, '    composition=' + ','.join(metrics['composition_ids']))
         if selected.get("source_sound"):
             sound = selected["source_sound"]
             _log(log, f"    opening sound={sound.get('word') or sound.get('action')} at {sound['start']:.3f}s")
@@ -449,8 +603,32 @@ def _select_candidate(config, source_infos, slots, scenes, inspect, inventory, a
     from autoedit.video.faces import lip_motion_evidence
     from autoedit.audio.onsets import AudioOnsetError
     alignment_attempts = 0
-    while True:
+    lip_info = {'samples': video_info.get('samples', []), 'source_kind': source_kind,
+                'source_speech': speech, 'verify_onsets': False}
+    if video_info.get('source_spans'):
+        lip_info['source_spans'] = video_info['source_spans']
+    if review_mode:
+        lip_info.update(method='sparse-review-only', dense_verification_deferred=True)
+        plan['review_status'] = 'manual_review_required'
+        plan['notes'].append('Fast review export: character exposure ranking is retained. '
+            'Source words are measured around provisional cuts only; dense faces, lips and '
+            'articulation onsets are not verified. Review every video cut and voice before final use.')
+        for slot in plan['slots']:
+            slot['video']['selection_metrics'].update(dense_clear_face_verified=False,
+                dense_lip_motion_verified=False, needs_review=True, verification_status='manual_review_required')
+        if plan.get('intro_fill'):
+            plan['intro_fill']['selection_metrics'].update(needs_review=True,
+                verification_status='manual_review_required', dense_clear_face_verified=False)
+        plan['cubase_slots'] = build_sampler_slots(scenes, plan['slots'], audio_items, lip_info, inventory)
+        for slot in plan['cubase_slots']:
+            if slot['audio_match'].get('method') == 'filename-visemes-and-dense-lip-rhythm':
+                slot['audio_match']['method'] = 'filename-visemes-and-sparse-lip-rhythm'
+            slot['audio_match'].update(needs_review=True, onset_verified=False, phoneme_sync_verified=False,
+                review_reason='Fast export: dense face/lip/onset verification deferred to manual review')
+        _log(log, 'Exporting the complete ranked allocation for manual review; dense verification is deferred')
+    while not review_mode:
         readable_slots = [s for s in plan["slots"] if s["video"]["selection_metrics"]["tier"] <= 2
+                          or s["video"]["selection_metrics"].get("require_clear_face")
                           or s["video"]["selection_metrics"].get("require_lip_motion")]
         lip_info = {"samples": []}
         for index, source_info in enumerate(source_infos):
@@ -469,6 +647,7 @@ def _select_candidate(config, source_infos, slots, scenes, inspect, inventory, a
                 refs = video_info.get("samples")
             refined = (_timed(config, 'dense_lips', refine_selected_cuts,source_info["path"], source_slots, out / "video_cache", source_kind=source_kind,
                                        main_group=character_cfg["main_group"],
+                                       object_config=video_cfg.get('object_detection'),
                                        character_samples=refs if source_info.get("character_analysis") else None,
                                        progress=lambda m: _log(log, "  " + m))
                     if source_slots and video_cfg.get("backend") != "opencv" else {"samples": []})
@@ -477,6 +656,20 @@ def _select_candidate(config, source_infos, slots, scenes, inspect, inventory, a
         onset_rejections = set()
         for slot in plan["slots"]:
             cut = slot["video"]
+            if cut['selection_metrics'].get('require_clear_face'):
+                from autoedit.video.refine import readable_face_fraction
+                dense_samples = [s for s in lip_info.get('samples', [])
+                    if not s.get('refinement_cut') or (
+                        abs(s['refinement_cut']['in_sec']-cut['in_sec']) < 1e-6
+                        and abs(s['refinement_cut']['out_sec']-cut['out_sec']) < 1e-6)]
+                dense = readable_face_fraction(dense_samples, cut['in_sec'], cut['out_sec'])
+                cut['selection_metrics']['dense_readable_face_fraction'] = dense['readable_face_fraction']
+                if dense['sample_coverage'] < .99 or dense['readable_face_fraction'] < .85:
+                    _log(log, f"  {slot['id']}: dense readable faces={dense['readable_face_fraction']:.1%}; "
+                              f"sample coverage={dense['sample_coverage']:.1%}; reselecting")
+                    rejected.append(slot)
+                    continue
+                cut['selection_metrics']['dense_clear_face_verified'] = True
             if cut["selection_metrics"].get("require_lip_motion"):
                 window = [s for s in lip_info.get("samples", [])
                           if cut["in_sec"] <= s["time_sec"] < cut["out_sec"] and s.get("clear_face")]
@@ -526,7 +719,7 @@ def _select_candidate(config, source_infos, slots, scenes, inspect, inventory, a
                     raise
         if not rejected:
             break
-        _log(log, "Lip/onset check rejected " + ", ".join(s["id"] for s in rejected)
+        _log(log, "Face/lip/onset check rejected " + ", ".join(s["id"] for s in rejected)
              + "; selecting alternative cuts with the same slot lengths and source gap.")
         alignment_attempts = 0
         for slot in rejected:
@@ -542,7 +735,7 @@ def _select_candidate(config, source_infos, slots, scenes, inspect, inventory, a
                 failed = (max(0., cut['in_sec']-.25), min(cut['out_sec'], cut['in_sec']+.35))
             known = rejected_by_source.setdefault(path, [])
             if failed in known:
-                raise InsufficientFootageError('No new verified lip candidates available')
+                raise InsufficientFootageError('No new verified face/lip/onset candidates available')
             known.append(failed)
             offset = global_start-cut['in_sec']
             rejected_ranges.append((failed[0]+offset, failed[1]+offset))
@@ -553,8 +746,13 @@ def _select_candidate(config, source_infos, slots, scenes, inspect, inventory, a
                                        video_info=video_info, notes=notes)["slots"]
     for slot in plan["slots"]:
         cut = slot["video"]
+        face_metric = ('sparse_readable_face=' + f"{cut['selection_metrics'].get('readable_face', 0):.2f}"
+                       if review_mode else 'dense_readable_face=' +
+                       f"{cut['selection_metrics'].get('dense_readable_face_fraction', 0):.2f}")
         _log(log, f"  final clip {slot['premiere']['nested_sequence']}: "
                   f"{cut['in_sec']:.3f}-{cut['out_sec']:.3f}s "
+                  f"{face_metric} "
+                  f"dense_face_verified={cut['selection_metrics'].get('dense_clear_face_verified', False)} "
                   f"dense_lip_motion={cut['selection_metrics'].get('dense_lip_motion_verified', False)}")
     lip_info.update(source_kind=source_kind, source_speech=speech)
     if video_info.get("source_spans"):
